@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["wadescan", "wadescan-common", "wadescan-ebpf"]
+default-members = ["wadescan", "wadescan-common"]
+
+[workspace.dependencies]
+aya = { version = "0.13.1", default-features = false }
+aya-build = { version = "0.1.2", default-features = false }
+aya-ebpf = { version = "0.1.1", default-features = false }
+aya-log = { version = "0.2.1", default-features = false }
+aya-log-ebpf = { version = "0.1.1", default-features = false }
+
+anyhow = { version = "1", default-features = false }
+clap = { version = "4.5.20", default-features = false, features = ["std"] }
+env_logger = { version = "0.11.5", default-features = false }
+libc = { version = "0.2.159", default-features = false }
+which = { version = "6.0.0", default-features = false }
+xdpilone = { version = "1.1.0", default-features = false }
+dashmap = { version = "6.1.0", default-features = false } 
+default-net = { version = "0.22.0", default-features = false }
+rand = { version = "0.9.0-beta.1", default-features = false }
+perfect_rand = { version = "0.3.0", default-features = false }
+tokio = { version = "1", default-features = false }
+
+[profile.release.package.wadescan-ebpf]
+debug = 2
+opt-level = 3
+codegen-units = 1
