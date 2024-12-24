@@ -505,14 +505,9 @@ async fn main() -> Result<(), Errno> {
         }
     });
 
-    for n in 0..1 {
-        // let shuffled_index = rng.shuffle(n as u64);
-        // let dest = ranges.index(shuffled_index as usize);
-
-        let dest = SocketAddrV4::new(
-            Ipv4Addr::from_str("78.189.59.154").unwrap(),
-            25565
-        );
+    for n in 0..ranges.count {
+        let shuffled_index = rng.shuffle(n as u64);
+        let dest = ranges.index(shuffled_index as usize);
 
         let ip = dest.ip().to_bits();
         let port = dest.port();

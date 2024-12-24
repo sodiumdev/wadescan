@@ -12,20 +12,22 @@ pub struct ScanRange {
 }
 
 impl ScanRange {
+    #[inline(always)]
     pub fn count_addresses(&self) -> usize {
         (u32::from(self.addr_end) as u64 - u32::from(self.addr_start) as u64 + 1) as usize
     }
 
+    #[inline(always)]
     pub fn count_ports(&self) -> usize {
         ((self.port_end - self.port_start) + 1) as usize
     }
 
-    /// Count the number of combinations of addresses and ports in this range.
+    #[inline(always)]
     pub fn count(&self) -> usize {
         self.count_addresses() * self.count_ports()
     }
 
-    /// Get the address and port at the given index.
+    #[inline(always)]
     pub fn index(&self, index: usize) -> SocketAddrV4 {
         let port_count = self.count_ports();
         let addr_index = index / port_count;
@@ -35,6 +37,7 @@ impl ScanRange {
         SocketAddrV4::new(Ipv4Addr::from(addr), port)
     }
 
+    #[inline(always)]
     pub fn single(addr: Ipv4Addr, port: u16) -> Self {
         Self {
             addr_start: addr,
@@ -43,6 +46,8 @@ impl ScanRange {
             port_end: port,
         }
     }
+
+    #[inline(always)]
     pub fn single_port(addr_start: Ipv4Addr, addr_end: Ipv4Addr, port: u16) -> Self {
         Self {
             addr_start,
@@ -51,6 +56,8 @@ impl ScanRange {
             port_end: port,
         }
     }
+
+    #[inline(always)]
     pub fn single_address(addr: Ipv4Addr, port_start: u16, port_end: u16) -> Self {
         Self {
             addr_start: addr,
@@ -72,16 +79,13 @@ impl ScanRanges {
         Self::default()
     }
 
-    /// Add to the set of ranges. There is no push function because it'd be too
-    /// inefficient, you can call this with a single-item vec if you really need
-    /// to.
+    #[inline(always)]
     pub fn extend(&mut self, ranges: Vec<ScanRange>) {
         self.ranges.extend(ranges);
         self.ranges.sort_by_key(|r| r.addr_start);
     }
 
-    /// Remove the given ranges from this set of ranges. Returns the ranges that
-    /// were renoved.
+    #[inline(always)]
     pub fn apply_exclude(&mut self, exclude_ranges: &Ipv4Ranges) -> Vec<Ipv4Range> {
         let mut ranges: Vec<ScanRange> = Vec::new();
         let mut removed_ranges: Vec<Ipv4Range> = Vec::new();
@@ -168,9 +172,7 @@ impl ScanRanges {
         removed_ranges
     }
 
-    /// Get the address and port at the given index.
-    ///
-    /// You should use [`Self::into_static`] and then call index on that.
+    #[inline(always)]
     pub fn slow_index(&self, index: usize) -> SocketAddrV4 {
         let mut i = 0;
         let mut index = index;
@@ -186,7 +188,7 @@ impl ScanRanges {
         panic!("index out of bounds");
     }
 
-    /// Count the total number of targets that are going to be scanned.
+    #[inline(always)]
     pub fn count(&self) -> usize {
         let mut total = 0;
         for range in &self.ranges {
@@ -195,14 +197,17 @@ impl ScanRanges {
         total
     }
 
+    #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.ranges.is_empty()
     }
 
+    #[inline(always)]
     pub fn ranges(&self) -> &Vec<ScanRange> {
         &self.ranges
     }
 
+    #[inline(always)]
     pub fn into_static(self) -> StaticScanRanges {
         let mut ranges = Vec::with_capacity(self.ranges.len());
         let mut index = 0;
@@ -234,6 +239,7 @@ pub struct StaticScanRange {
 }
 
 impl StaticScanRanges {
+    #[inline(always)]
     pub fn index(&self, index: usize) -> SocketAddrV4 {
         // binary search to find the range that contains the index
         let mut start = 0;
