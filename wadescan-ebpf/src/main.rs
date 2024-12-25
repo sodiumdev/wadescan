@@ -8,9 +8,6 @@ use aya_ebpf::macros::map;
 use aya_ebpf::maps::RingBuf;
 use aya_ebpf::{macros::xdp, programs::XdpContext};
 use core::slice::from_raw_parts;
-use aya_ebpf::cty::c_long;
-use aya_ebpf::maps::ring_buf::RingBufEntry;
-use aya_log_ebpf::info;
 use network_types::eth::{EthHdr, EtherType};
 use network_types::ip::{IpProto, Ipv4Hdr};
 use network_types::tcp::TcpHdr;
@@ -20,7 +17,7 @@ const LEN_SIZE: usize = size_of::<u16>();
 const MAX_SIZE: usize = u16::MAX as usize;
 
 #[map]
-static RING_BUF: RingBuf = RingBuf::with_byte_size((16384 * (PacketHeader::LEN + LEN_SIZE + MAX_SIZE + 8)) as u32, 0);
+static RING_BUF: RingBuf = RingBuf::with_byte_size((128 * (PacketHeader::LEN + LEN_SIZE + MAX_SIZE + 8)) as u32, 0);
 
 const PORT: u16 = 1337u16.to_be();
 

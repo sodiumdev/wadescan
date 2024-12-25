@@ -17,10 +17,11 @@ default-net = { workspace = true, default-features = true }
 rand = { workspace = true, default-features = true }
 perfect_rand = { workspace = true, default-features = true }
 tokio = { workspace = true, features = ["full"] }
-
-clap = { workspace = true, features = ["derive"] }
-bytes = "1.9.0"
+rustc-hash = "2.1.0"
 log = "0.4.22"
+pnet_packet = "0.35.0"
+pnet_base = "0.35.0"
+
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }
