@@ -1,12 +1,13 @@
 #![no_std]
 #![no_main]
 
+use core::mem::offset_of;
 use core::ptr;
 use aya_ebpf::bindings::xdp_action::XDP_PASS;
 use aya_ebpf::helpers::bpf_xdp_load_bytes;
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::RingBuf;
-use aya_ebpf::{macros::xdp, programs::XdpContext};
+use aya_ebpf::{bpf_printk, macros::xdp, programs::XdpContext};
 use core::slice::from_raw_parts;
 use network_types::eth::{EthHdr, EtherType};
 use network_types::ip::{IpProto, Ipv4Hdr};
@@ -19,7 +20,7 @@ const MAX_SIZE: usize = u16::MAX as usize;
 #[map]
 static RING_BUF: RingBuf = RingBuf::with_byte_size((128 * (PacketHeader::LEN + LEN_SIZE + MAX_SIZE + 8)) as u32, 0);
 
-const PORT: u16 = 1337u16.to_be();
+const PORT: u16 = 61000u16.to_be();
 
 #[xdp]
 pub fn wadescan(ctx: XdpContext) -> u32 {
