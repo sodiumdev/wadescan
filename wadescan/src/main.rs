@@ -14,17 +14,17 @@ use std::net::Ipv4Addr;
 use std::num::NonZeroU32;
 use std::ptr;
 use std::ptr::NonNull;
-use std::slice::from_raw_parts;
-use std::sync::{Arc, LazyLock};
+use std::slice::{from_raw_parts, from_raw_parts_mut};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::unix::AsyncFd;
 use wadescan_common::{PacketHeader, PacketType};
 use xdpilone::xdp::XdpDesc;
 use xdpilone::{BufIdx, Errno, IfInfo, Socket, SocketConfig, Umem, UmemConfig};
-use log::{debug, trace};
+use log::debug;
 use pnet_base::MacAddr;
 use rustc_hash::{FxBuildHasher, FxHasher};
-use pnet_packet::{ethernet::{EtherTypes, MutableEthernetPacket}, ip::IpNextHeaderProtocols, ipv4::{MutableIpv4Packet}, tcp, tcp::{MutableTcpPacket, TcpFlags, TcpOption, TcpOptionPacket}, MutablePacket, Packet as OtherPacket, PacketSize};
+use pnet_packet::{ethernet::{EtherTypes, MutableEthernetPacket}, ip::IpNextHeaderProtocols, ipv4::{MutableIpv4Packet}, tcp, tcp::{MutableTcpPacket, TcpFlags, TcpOption, TcpOptionPacket}, Packet as OtherPacket};
 
 #[inline(always)]
 fn build_latest_request(protocol_version: i32, hostname: &str, port: u16) -> Vec<u8> {
@@ -68,33 +68,6 @@ fn write_varint(writer: &mut Vec<u8>, mut value: i32) {
     }
 }
 
-static PING_DATA: LazyLock<Vec<u8>> = LazyLock::new(|| build_latest_request(767, "wadescan", 25565));
-
-#[repr(u8)]
-#[derive(PartialEq, Eq, Debug, Copy, Clone)]
-enum PayloadType {
-    None,
-    Ping
-}
-
-impl PayloadType {
-    #[inline(always)]
-    fn len(&self) -> usize {
-        match self.data() {
-            Some(x) => x.len(),
-            None => 0
-        }
-    }
-
-    #[inline(always)]
-    fn data(&self) -> Option<&[u8]> {
-        match self {
-            PayloadType::None => None,
-            PayloadType::Ping => Some(&PING_DATA)
-        }
-    }
-}
-
 #[repr(C, packed)]
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
 struct Packet {
@@ -103,7 +76,7 @@ struct Packet {
     port: u16,
     seq: u32,
     ack: u32,
-    payload: PayloadType
+    ping: bool
 }
 
 struct ConnectionState {
@@ -197,6 +170,9 @@ async fn main() -> Result<(), Errno> {
         )
     };
 
+    let ping_data = Arc::new(build_latest_request(767, "wadescan", 25565));
+    let ping_data_b = ping_data.clone();
+
     let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
         "/wadescan"
@@ -263,38 +239,44 @@ async fn main() -> Result<(), Errno> {
     let sender_a = Arc::new(sender);
     let sender_b = sender_a.clone();
 
-    let mut base_frame = umem.frame(BufIdx(0)).unwrap();
-    let offset = base_frame.offset;
-    let base = unsafe { base_frame.addr.as_mut() };
-
     let iface = get_interfaces().into_iter()
         .find(|i| i.name == "eth0").unwrap();
     let gateway_mac = iface.gateway.unwrap().mac_addr.octets();
     let iface_mac = iface.mac_addr.unwrap().octets();
     let source_ip = iface.ipv4.first().unwrap().addr;
 
-    let (ether_base, base) = base.split_at_mut(14);
-    {
-        let mut ethernet_packet = MutableEthernetPacket::new(ether_base).unwrap();
-        ethernet_packet.set_destination(MacAddr::from(gateway_mac));
-        ethernet_packet.set_source(MacAddr::from(iface_mac));
-        ethernet_packet.set_ethertype(EtherTypes::Ipv4);
-    }
+    let frame_count = 256usize;
+    let mut frames = (0..frame_count)
+        .map(|i| {
+            let mut frame = umem.frame(BufIdx(i as u32)).unwrap();
+            let base = unsafe { frame.addr.as_mut() };
 
-    let (ipv4_base, base) = base.split_at_mut(20);
-    let mut ipv4_packet = MutableIpv4Packet::new(ipv4_base).unwrap();
-    ipv4_packet.set_version(4);
-    ipv4_packet.set_header_length(5);
-    ipv4_packet.set_dscp(0);
-    ipv4_packet.set_ecn(0);
-    ipv4_packet.set_identification(1);
-    ipv4_packet.set_flags(0b010);
-    ipv4_packet.set_fragment_offset(0);
-    ipv4_packet.set_ttl(64);
-    ipv4_packet.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
-    ipv4_packet.set_source(source_ip);
-    ipv4_packet.set_options(&[]);
+            let (ether_base, base) = base.split_at_mut(14);
+            {
+                let mut ethernet_packet = MutableEthernetPacket::new(ether_base).unwrap();
+                ethernet_packet.set_destination(MacAddr::from(gateway_mac));
+                ethernet_packet.set_source(MacAddr::from(iface_mac));
+                ethernet_packet.set_ethertype(EtherTypes::Ipv4);
+            }
 
+            let (ipv4_base, _) = base.split_at_mut(20);
+            let mut ipv4_packet = MutableIpv4Packet::new(ipv4_base).unwrap();
+            ipv4_packet.set_version(4);
+            ipv4_packet.set_header_length(5);
+            ipv4_packet.set_dscp(0);
+            ipv4_packet.set_ecn(0);
+            ipv4_packet.set_identification(1);
+            ipv4_packet.set_flags(0b010);
+            ipv4_packet.set_fragment_offset(0);
+            ipv4_packet.set_ttl(64);
+            ipv4_packet.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
+            ipv4_packet.set_source(source_ip);
+            ipv4_packet.set_options(&[]);
+
+            (frame.offset, unsafe { frame.addr.byte_add(14).as_mut() })
+        })
+        .collect::<Vec<_>>();
+    
     let syn_options = [TcpOption::mss(1340), TcpOption::nop(), TcpOption::nop(), TcpOption::sack_perm()];
     let syn_doff = 5 + (syn_options.iter().map(TcpOptionPacket::packet_size).sum::<usize>() + 3) / 4;
 
@@ -332,7 +314,7 @@ async fn main() -> Result<(), Errno> {
                             port,
                             seq: ack,
                             ack: seq + 1,
-                            payload: PayloadType::None
+                            ping: false
                         }).unwrap();
 
                         sender_b.send(Packet {
@@ -341,7 +323,7 @@ async fn main() -> Result<(), Errno> {
                             port,
                             seq: ack,
                             ack: seq + 1,
-                            payload: PayloadType::Ping
+                            ping: true
                         }).unwrap();
                     }
 
@@ -363,7 +345,7 @@ async fn main() -> Result<(), Errno> {
                                     port,
                                     seq: ack,
                                     ack: conn.remote_seq,
-                                    payload: PayloadType::None
+                                    ping: false
                                 }).unwrap();
 
                                 continue;
@@ -375,7 +357,7 @@ async fn main() -> Result<(), Errno> {
 
                             (parse_response(&conn.data), remote_seq)
                         } else {
-                            if ack != cookie(ip, port, seed).wrapping_add((PayloadType::Ping.len() + 1) as u32) {
+                            if ack != cookie(ip, port, seed).wrapping_add((ping_data.len() + 1) as u32) {
                                 debug!("cookie mismatch when reading data from: {}", ip);
 
                                 continue;
@@ -402,7 +384,7 @@ async fn main() -> Result<(), Errno> {
                             port,
                             seq: ack,
                             ack: remote_seq,
-                            payload: PayloadType::None
+                            ping: false
                         }).unwrap();
 
                         if let Some(data) = ping_response {
@@ -415,7 +397,7 @@ async fn main() -> Result<(), Errno> {
                                 port,
                                 seq: ack,
                                 ack: remote_seq,
-                                payload: PayloadType::None
+                                ping: false
                             }).unwrap();
                         }
                     }
@@ -428,7 +410,7 @@ async fn main() -> Result<(), Errno> {
                                 port,
                                 seq: conn.local_seq,
                                 ack: seq + 1,
-                                payload: PayloadType::None
+                                ping: false
                             }).unwrap();
 
                             if !conn.fin_sent {
@@ -438,7 +420,7 @@ async fn main() -> Result<(), Errno> {
                                     port,
                                     seq: conn.local_seq,
                                     ack: seq + 1,
-                                    payload: PayloadType::None
+                                    ping: false
                                 }).unwrap();
 
                                 conn.fin_sent = true;
@@ -454,7 +436,7 @@ async fn main() -> Result<(), Errno> {
                                 port,
                                 seq: ack,
                                 ack: seq + 1,
-                                payload: PayloadType::None
+                                ping: false
                             }).unwrap();
                         }
                     }
@@ -505,11 +487,32 @@ async fn main() -> Result<(), Errno> {
     });
 
     tokio::spawn(async move {
-        while let Some(Packet { ty, ip, port, seq, ack, payload }) = receiver.recv().await {
+        let mut frame = 0;
+        
+        while let Some(Packet { ty, ip, port, seq, ack, ping }) = receiver.recv().await {
+            let (offset, base) = frames.get_mut(frame).unwrap();
+            
+            frame += 1;
+            if frame >= frame_count {
+                frame = 0;
+            }
+            
             let len = {
                 let tcp_packet_len = if ty == PacketType::Syn {
                     syn_doff * 4
-                } else { 20 } + payload.len();
+                } else { 20 } + if ping {
+                    ping_data_b.len()
+                } else { 0 };
+
+                let (ipv4_base, base) = base.split_at_mut(20);
+                let ipv4_len = 20 + tcp_packet_len;
+
+                let mut ipv4_packet = MutableIpv4Packet::new(ipv4_base).unwrap();
+                ipv4_packet.set_destination(ip);
+                ipv4_packet.set_total_length(ipv4_len as u16);
+                ipv4_packet.set_checksum(
+                    ipv4_checksum(ipv4_packet.packet())
+                );
 
                 let (tcp_base, _) = base.split_at_mut(tcp_packet_len);
                 let mut tcp_packet = MutableTcpPacket::new(tcp_base).unwrap();
@@ -526,27 +529,20 @@ async fn main() -> Result<(), Errno> {
                     tcp_packet.set_options(&[]);
                 }
 
-                let ipv4_len = 20 + tcp_packet_len;
-                ipv4_packet.set_destination(ip);
-                ipv4_packet.set_total_length(ipv4_len as u16);
-                ipv4_packet.set_checksum(
-                    ipv4_checksum(ipv4_packet.packet())
-                );
-
                 tcp_packet.set_destination(port);
                 tcp_packet.set_sequence(seq);
                 tcp_packet.set_acknowledgement(ack);
                 tcp_packet.set_flags(match ty {
                     PacketType::Syn => TcpFlags::SYN,
                     PacketType::Ack => TcpFlags::ACK,
-                    PacketType::Fin => TcpFlags::FIN | TcpFlags::ACK,
+                    PacketType::Fin => TcpFlags::FIN,
                     PacketType::PshAck => TcpFlags::PSH | TcpFlags::ACK,
 
                     _ => unreachable!()
                 });
 
-                if let Some(payload) = payload.data() {
-                    tcp_packet.set_payload(payload);
+                if ping {
+                    tcp_packet.set_payload(&ping_data_b);
                 }
 
                 tcp_packet.set_checksum(tcp::ipv4_checksum(&tcp_packet.to_immutable(), &source_ip, &ip));
@@ -557,7 +553,7 @@ async fn main() -> Result<(), Errno> {
             {
                 let mut writer = tx.transmit(1);
                 writer.insert_once(XdpDesc {
-                    addr: offset,
+                    addr: *offset,
                     len: len as u32,
                     options: 0
                 });
@@ -574,10 +570,10 @@ async fn main() -> Result<(), Errno> {
     for n in 0..ranges.count {
         let shuffled_index = rng.shuffle(n as u64);
         let dest = ranges.index(shuffled_index as usize);
-
+    
         let ip = *dest.ip();
         let port = dest.port();
-    //
+
     // for _ in 0..1 {
     //     let ip = Ipv4Addr::new(78, 189, 59, 154);
     //     let port = 25565;
@@ -588,7 +584,7 @@ async fn main() -> Result<(), Errno> {
             port,
             seq: cookie(ip, port, seed),
             ack: 0,
-            payload: PayloadType::None
+            ping: false
         }).unwrap();
     }
 
