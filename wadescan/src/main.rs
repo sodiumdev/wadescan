@@ -1,3 +1,5 @@
+#![feature(const_vec_string_slice)]
+
 mod range;
 mod excludefile;
 
@@ -12,9 +14,10 @@ use std::hash::Hasher;
 use std::io::{Cursor, Read};
 use std::net::Ipv4Addr;
 use std::num::NonZeroU32;
-use std::ptr;
+use std::{mem, ptr};
+use std::ops::Add;
 use std::ptr::NonNull;
-use std::slice::{from_raw_parts, from_raw_parts_mut};
+use std::slice::from_raw_parts;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::unix::AsyncFd;
@@ -24,7 +27,7 @@ use xdpilone::{BufIdx, Errno, IfInfo, Socket, SocketConfig, Umem, UmemConfig};
 use log::debug;
 use pnet_base::MacAddr;
 use rustc_hash::{FxBuildHasher, FxHasher};
-use pnet_packet::{ethernet::{EtherTypes, MutableEthernetPacket}, ip::IpNextHeaderProtocols, ipv4::{MutableIpv4Packet}, tcp, tcp::{MutableTcpPacket, TcpFlags, TcpOption, TcpOptionPacket}, Packet as OtherPacket};
+use pnet_packet::{ethernet::{EtherTypes, MutableEthernetPacket}, ip::IpNextHeaderProtocols, ipv4::{MutableIpv4Packet}, tcp, tcp::{MutableTcpPacket, TcpFlags, TcpOption, TcpOptionPacket}, util, Packet as OtherPacket};
 
 #[inline(always)]
 fn build_latest_request(protocol_version: i32, hostname: &str, port: u16) -> Vec<u8> {
@@ -94,9 +97,9 @@ fn read_varint(reader: &mut (dyn Read + Unpin + Send)) -> Option<i32> {
     let mut buffer = [0];
     let mut ans = 0;
     for i in 0..5 {
-        reader.read_exact(&mut buffer).ok()?;
+        if reader.read_exact(&mut buffer).is_err() { return None };
+        
         ans |= ((buffer[0] & 0b0111_1111) as i32) << (7 * i);
-
         if buffer[0] & 0b1000_0000 == 0 {
             return Some(ans);
         }
@@ -117,7 +120,7 @@ fn parse_response(response: &[u8]) -> Option<Vec<u8>> {
     }
 
     let position = stream.position() as usize;
-    let status_buffer = &stream.into_inner()[position..];
+    let status_buffer = &response[position..];
     if status_buffer.len() < response_length as usize {
         return None
     }
@@ -136,24 +139,69 @@ fn cookie(ip: Ipv4Addr, port: u16, seed: u64) -> u32 {
 }
 
 #[inline(always)]
-fn ipv4_checksum(header: &[u8]) -> u16 {
-    assert!(header.len() >= 20);
-
-    let sum =
+const fn ipv4_checksum(header: &[u8]) -> u16 {
+    unsafe {
+        core::hint::assert_unchecked(header.len() >= 20);
+    }
+    
+    finalize_checksum(
         u16::from_be_bytes([header[0], header[1]]) as u32
-        + u16::from_be_bytes([header[2], header[3]]) as u32
-        + u16::from_be_bytes([header[4], header[5]]) as u32
-        + u16::from_be_bytes([header[6], header[7]]) as u32
-        + u16::from_be_bytes([header[8], header[9]]) as u32
-        + u16::from_be_bytes([header[12], header[13]]) as u32
-        + u16::from_be_bytes([header[14], header[15]]) as u32
-        + u16::from_be_bytes([header[16], header[17]]) as u32
-        + u16::from_be_bytes([header[18], header[19]]) as u32;
+            + u16::from_be_bytes([header[2], header[3]]) as u32
+            + u16::from_be_bytes([header[4], header[5]]) as u32
+            + u16::from_be_bytes([header[6], header[7]]) as u32
+            + u16::from_be_bytes([header[8], header[9]]) as u32
+            + u16::from_be_bytes([header[12], header[13]]) as u32
+            + u16::from_be_bytes([header[14], header[15]]) as u32
+            + u16::from_be_bytes([header[16], header[17]]) as u32
+            + u16::from_be_bytes([header[18], header[19]]) as u32
+    )
+}
 
+#[inline(always)]
+const fn finalize_checksum(sum: u32) -> u16 {
     let sum = (sum >> 16) + (sum & 0xffff);
     let sum = sum + (sum >> 16);
 
     !(sum as u16)
+}
+
+#[inline(always)]
+const fn tcp_sum(data: *const u8, len: usize) -> u32 {
+    let mut sum = 0u32;
+    let mut i = 0;
+    while len >= (i + 1) << 1 {
+        sum += u16::from_be(unsafe { *(data.add(i << 1).cast()) }) as u32;
+        
+        i += 1;
+    }
+    
+    if len & 1 != 0 {
+        sum += unsafe { (*(data.add(len - 1))) as u32 } << 8;
+    }
+
+    sum
+}
+
+#[inline(always)]
+const fn tcp_checksum(
+    data: *const u8,
+    len: usize,
+    source: &Ipv4Addr,
+    destination: &Ipv4Addr
+) -> u16 {
+    finalize_checksum(
+        ipv4_word_sum(source)
+            + ipv4_word_sum(destination)
+            + 6
+            + len as u32
+            + tcp_sum(data, len)
+    )
+}
+
+#[inline(always)]
+const fn ipv4_word_sum(ip: &Ipv4Addr) -> u32 {
+    let octets = ip.octets();
+    u16::from_be_bytes([octets[0], octets[1]]) as u32 + u16::from_be_bytes([octets[2], octets[1]]) as u32
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -204,7 +252,7 @@ async fn main() -> Result<(), Errno> {
     let rng = PerfectRng::new(ranges.count() as u64, seed, 3);
     let ranges = ranges.into_static();
 
-    const UMEM_SIZE: usize = 1 << 20;
+    const UMEM_SIZE: usize = 1 << 21;
     let layout = Layout::from_size_align(UMEM_SIZE, 16384).unwrap();
     let ptr = unsafe { NonNull::slice_from_raw_parts(NonNull::new_unchecked(alloc(layout)), UMEM_SIZE) };
 
@@ -245,7 +293,7 @@ async fn main() -> Result<(), Errno> {
     let iface_mac = iface.mac_addr.unwrap().octets();
     let source_ip = iface.ipv4.first().unwrap().addr;
 
-    let frame_count = 256usize;
+    let frame_count = 512usize;
     let mut frames = (0..frame_count)
         .map(|i| {
             let mut frame = umem.frame(BufIdx(i as u32)).unwrap();
@@ -259,7 +307,7 @@ async fn main() -> Result<(), Errno> {
                 ethernet_packet.set_ethertype(EtherTypes::Ipv4);
             }
 
-            let (ipv4_base, _) = base.split_at_mut(20);
+            let (ipv4_base, base) = base.split_at_mut(20);
             let mut ipv4_packet = MutableIpv4Packet::new(ipv4_base).unwrap();
             ipv4_packet.set_version(4);
             ipv4_packet.set_header_length(5);
@@ -273,10 +321,16 @@ async fn main() -> Result<(), Errno> {
             ipv4_packet.set_source(source_ip);
             ipv4_packet.set_options(&[]);
 
-            (frame.offset, unsafe { frame.addr.byte_add(14).as_mut() })
+            let mut tcp_packet = MutableTcpPacket::new(base).unwrap();
+            tcp_packet.set_source(61000);
+            tcp_packet.set_reserved(0);
+            tcp_packet.set_window(32768);
+            tcp_packet.set_urgent_ptr(0);
+
+            (frame.offset, ipv4_packet, tcp_packet)
         })
         .collect::<Vec<_>>();
-    
+
     let syn_options = [TcpOption::mss(1340), TcpOption::nop(), TcpOption::nop(), TcpOption::sack_perm()];
     let syn_doff = 5 + (syn_options.iter().map(TcpOptionPacket::packet_size).sum::<usize>() + 3) / 4;
 
@@ -488,15 +542,15 @@ async fn main() -> Result<(), Errno> {
 
     tokio::spawn(async move {
         let mut frame = 0;
-        
+
         while let Some(Packet { ty, ip, port, seq, ack, ping }) = receiver.recv().await {
-            let (offset, base) = frames.get_mut(frame).unwrap();
-            
+            let (offset, ipv4_packet, tcp_packet) = frames.get_mut(frame).unwrap();
+
             frame += 1;
             if frame >= frame_count {
                 frame = 0;
             }
-            
+
             let len = {
                 let tcp_packet_len = if ty == PacketType::Syn {
                     syn_doff * 4
@@ -504,22 +558,12 @@ async fn main() -> Result<(), Errno> {
                     ping_data_b.len()
                 } else { 0 };
 
-                let (ipv4_base, base) = base.split_at_mut(20);
                 let ipv4_len = 20 + tcp_packet_len;
-
-                let mut ipv4_packet = MutableIpv4Packet::new(ipv4_base).unwrap();
                 ipv4_packet.set_destination(ip);
                 ipv4_packet.set_total_length(ipv4_len as u16);
                 ipv4_packet.set_checksum(
                     ipv4_checksum(ipv4_packet.packet())
                 );
-
-                let (tcp_base, _) = base.split_at_mut(tcp_packet_len);
-                let mut tcp_packet = MutableTcpPacket::new(tcp_base).unwrap();
-                tcp_packet.set_source(61000);
-                tcp_packet.set_reserved(0);
-                tcp_packet.set_window(64320);
-                tcp_packet.set_urgent_ptr(0);
 
                 if ty == PacketType::Syn {
                     tcp_packet.set_data_offset(syn_doff as u8);
@@ -529,6 +573,7 @@ async fn main() -> Result<(), Errno> {
                     tcp_packet.set_options(&[]);
                 }
 
+                tcp_packet.set_checksum(0);
                 tcp_packet.set_destination(port);
                 tcp_packet.set_sequence(seq);
                 tcp_packet.set_acknowledgement(ack);
@@ -545,7 +590,7 @@ async fn main() -> Result<(), Errno> {
                     tcp_packet.set_payload(&ping_data_b);
                 }
 
-                tcp_packet.set_checksum(tcp::ipv4_checksum(&tcp_packet.to_immutable(), &source_ip, &ip));
+                tcp_packet.set_checksum(tcp_checksum(tcp_packet.packet().as_ptr(), tcp_packet_len, &source_ip, &ip));
 
                 ipv4_len + 14
             };
@@ -570,13 +615,9 @@ async fn main() -> Result<(), Errno> {
     for n in 0..ranges.count {
         let shuffled_index = rng.shuffle(n as u64);
         let dest = ranges.index(shuffled_index as usize);
-    
-        let ip = *dest.ip();
-        let port = dest.port();
 
-    // for _ in 0..1 {
-    //     let ip = Ipv4Addr::new(78, 189, 59, 154);
-    //     let port = 25565;
+        let ip = dest.0;
+        let port = dest.1;
 
         sender_a.send(Packet {
             ty: PacketType::Syn,

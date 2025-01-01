@@ -1,7 +1,4 @@
-use std::{
-    mem,
-    net::{Ipv4Addr, SocketAddrV4},
-};
+use std::{mem, net::Ipv4Addr};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanRange {
@@ -13,32 +10,33 @@ pub struct ScanRange {
 
 impl ScanRange {
     #[inline(always)]
-    pub fn count_addresses(&self) -> usize {
-        (u32::from(self.addr_end) as u64 - u32::from(self.addr_start) as u64 + 1) as usize
+    pub const fn count_addresses(&self) -> usize {
+        (self.addr_end.to_bits() as u64 - self.addr_start.to_bits() as u64 + 1) as usize
     }
 
     #[inline(always)]
-    pub fn count_ports(&self) -> usize {
+    pub const fn count_ports(&self) -> usize {
         ((self.port_end - self.port_start) + 1) as usize
     }
 
     #[inline(always)]
-    pub fn count(&self) -> usize {
+    pub const fn count(&self) -> usize {
         self.count_addresses() * self.count_ports()
     }
 
     #[inline(always)]
-    pub fn index(&self, index: usize) -> SocketAddrV4 {
+    pub const fn index(&self, index: usize) -> (Ipv4Addr, u16) {
         let port_count = self.count_ports();
         let addr_index = index / port_count;
         let port_index = index % port_count;
-        let addr = u32::from(self.addr_start) + addr_index as u32;
+        let addr = self.addr_start.to_bits() + addr_index as u32;
         let port = self.port_start + port_index as u16;
-        SocketAddrV4::new(Ipv4Addr::from(addr), port)
+
+        (Ipv4Addr::from_bits(addr), port)
     }
 
     #[inline(always)]
-    pub fn single(addr: Ipv4Addr, port: u16) -> Self {
+    pub const fn single(addr: Ipv4Addr, port: u16) -> Self {
         Self {
             addr_start: addr,
             addr_end: addr,
@@ -48,7 +46,7 @@ impl ScanRange {
     }
 
     #[inline(always)]
-    pub fn single_port(addr_start: Ipv4Addr, addr_end: Ipv4Addr, port: u16) -> Self {
+    pub const fn single_port(addr_start: Ipv4Addr, addr_end: Ipv4Addr, port: u16) -> Self {
         Self {
             addr_start,
             addr_end,
@@ -58,7 +56,7 @@ impl ScanRange {
     }
 
     #[inline(always)]
-    pub fn single_address(addr: Ipv4Addr, port_start: u16, port_end: u16) -> Self {
+    pub const fn single_address(addr: Ipv4Addr, port_start: u16, port_end: u16) -> Self {
         Self {
             addr_start: addr,
             addr_end: addr,
@@ -173,22 +171,6 @@ impl ScanRanges {
     }
 
     #[inline(always)]
-    pub fn slow_index(&self, index: usize) -> SocketAddrV4 {
-        let mut i = 0;
-        let mut index = index;
-        while i < self.ranges.len() {
-            let range = &self.ranges[i];
-            let count = range.count();
-            if index < count {
-                return range.index(index);
-            }
-            index -= count;
-            i += 1;
-        }
-        panic!("index out of bounds");
-    }
-
-    #[inline(always)]
     pub fn count(&self) -> usize {
         let mut total = 0;
         for range in &self.ranges {
@@ -232,6 +214,7 @@ pub struct StaticScanRanges {
     pub ranges: Vec<StaticScanRange>,
     pub count: usize,
 }
+
 pub struct StaticScanRange {
     pub range: ScanRange,
     count: usize,
@@ -240,13 +223,19 @@ pub struct StaticScanRange {
 
 impl StaticScanRanges {
     #[inline(always)]
-    pub fn index(&self, index: usize) -> SocketAddrV4 {
-        // binary search to find the range that contains the index
+    pub const fn index(&self, index: usize) -> (Ipv4Addr, u16) {
         let mut start = 0;
         let mut end = self.ranges.len();
         while start < end {
-            let mid = (start + end) / 2;
-            let range = &self.ranges[mid];
+            let mid = (start + end) >> 1;
+            let range = unsafe {
+                if mid >= self.ranges.len() {
+                    core::hint::unreachable_unchecked()
+                }
+
+                &*(self.ranges.as_ptr().add(mid))
+            };
+            
             if range.index + range.count <= index {
                 start = mid + 1;
             } else if range.index > index {
@@ -255,6 +244,7 @@ impl StaticScanRanges {
                 return range.range.index(index - range.index);
             }
         }
+
         panic!("index out of bounds");
     }
 }
