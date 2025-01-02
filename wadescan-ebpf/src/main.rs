@@ -1,14 +1,12 @@
 #![no_std]
 #![no_main]
 
-use core::mem::offset_of;
 use core::ptr;
 use aya_ebpf::bindings::xdp_action::XDP_PASS;
 use aya_ebpf::helpers::bpf_xdp_load_bytes;
 use aya_ebpf::macros::map;
 use aya_ebpf::maps::RingBuf;
-use aya_ebpf::{bpf_printk, macros::xdp, programs::XdpContext};
-use core::slice::from_raw_parts;
+use aya_ebpf::{macros::xdp, programs::XdpContext};
 use network_types::eth::{EthHdr, EtherType};
 use network_types::ip::{IpProto, Ipv4Hdr};
 use network_types::tcp::TcpHdr;
@@ -87,9 +85,9 @@ fn try_receive(ctx: XdpContext) -> Result<u32, ()> {
 }
 
 #[inline(always)]
-unsafe fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
-    let start = ctx.data();
-    let end = ctx.data_end();
+const unsafe fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
+    let start = (*ctx.ctx).data as usize;
+    let end = (*ctx.ctx).data_end as usize;
     let len = size_of::<T>();
 
     let addr = start + offset;
@@ -140,16 +138,6 @@ fn output(ctx: &XdpContext, packet: PacketHeader, offset: usize, len: usize) -> 
         }
 
         None => Err(())
-    }
-}
-
-#[inline(always)]
-fn as_slice<T>(reference: &T) -> &[u8] {
-    unsafe {
-        from_raw_parts(
-            (reference as *const T) as *const u8,
-            size_of::<T>(),
-        )
     }
 }
 

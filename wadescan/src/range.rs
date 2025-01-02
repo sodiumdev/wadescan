@@ -229,10 +229,8 @@ impl StaticScanRanges {
         while start < end {
             let mid = (start + end) >> 1;
             let range = unsafe {
-                if mid >= self.ranges.len() {
-                    core::hint::unreachable_unchecked()
-                }
-
+                core::hint::assert_unchecked(mid < self.ranges.len());
+                
                 &*(self.ranges.as_ptr().add(mid))
             };
             

@@ -2,6 +2,8 @@
 
 mod range;
 mod excludefile;
+mod checksum;
+mod ping;
 
 use crate::range::{ScanRange, ScanRanges};
 use aya::maps::RingBuf;
@@ -10,12 +12,10 @@ use dashmap::DashMap;
 use default_net::get_interfaces;
 use perfect_rand::PerfectRng;
 use std::alloc::{alloc, Layout};
-use std::hash::Hasher;
 use std::io::{Cursor, Read};
 use std::net::Ipv4Addr;
 use std::num::NonZeroU32;
-use std::{mem, ptr};
-use std::ops::Add;
+use std::ptr;
 use std::ptr::NonNull;
 use std::slice::from_raw_parts;
 use std::sync::Arc;
@@ -26,55 +26,13 @@ use xdpilone::xdp::XdpDesc;
 use xdpilone::{BufIdx, Errno, IfInfo, Socket, SocketConfig, Umem, UmemConfig};
 use log::debug;
 use pnet_base::MacAddr;
-use rustc_hash::{FxBuildHasher, FxHasher};
-use pnet_packet::{ethernet::{EtherTypes, MutableEthernetPacket}, ip::IpNextHeaderProtocols, ipv4::{MutableIpv4Packet}, tcp, tcp::{MutableTcpPacket, TcpFlags, TcpOption, TcpOptionPacket}, util, Packet as OtherPacket};
-
-#[inline(always)]
-fn build_latest_request(protocol_version: i32, hostname: &str, port: u16) -> Vec<u8> {
-    let mut buffer = vec![0x00];
-    write_varint(&mut buffer, protocol_version);
-    write_varint(&mut buffer, hostname.len() as i32);
-
-    buffer.extend_from_slice(hostname.as_bytes());
-    buffer.extend_from_slice(&[
-        (port >> 8) as u8,
-        (port & 0b1111_1111) as u8,
-        0x01,
-    ]);
-
-    let mut full_buffer = vec![];
-    write_varint(&mut full_buffer, buffer.len() as i32);
-    full_buffer.append(&mut buffer);
-    full_buffer.extend_from_slice(&[
-        1,
-        0x00,
-    ]);
-
-    full_buffer
-}
-
-#[inline(always)]
-fn write_varint(writer: &mut Vec<u8>, mut value: i32) {
-    let mut buffer = [0];
-    if value == 0 {
-        writer.extend_from_slice(&buffer);
-    }
-
-    while value != 0 {
-        buffer[0] = (value & 0b0111_1111) as u8;
-        value = (value >> 7) & (i32::MAX >> 6);
-        if value != 0 {
-            buffer[0] |= 0b1000_0000;
-        }
-
-        writer.extend_from_slice(&buffer);
-    }
-}
+use rustc_hash::FxBuildHasher;
+use pnet_packet::{ethernet::{EtherTypes, MutableEthernetPacket}, ip::IpNextHeaderProtocols, ipv4::{MutableIpv4Packet}, tcp::{MutableTcpPacket, TcpFlags, TcpOption}, util, Packet as OtherPacket};
 
 #[repr(C, packed)]
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
 struct Packet {
-    ty: PacketType,
+    ty: u8,
     ip: Ipv4Addr,
     port: u16,
     seq: u32,
@@ -98,7 +56,7 @@ fn read_varint(reader: &mut (dyn Read + Unpin + Send)) -> Option<i32> {
     let mut ans = 0;
     for i in 0..5 {
         if reader.read_exact(&mut buffer).is_err() { return None };
-        
+
         ans |= ((buffer[0] & 0b0111_1111) as i32) << (7 * i);
         if buffer[0] & 0b1000_0000 == 0 {
             return Some(ans);
@@ -128,83 +86,9 @@ fn parse_response(response: &[u8]) -> Option<Vec<u8>> {
     Some(status_buffer.to_vec())
 }
 
-#[inline(always)]
-fn cookie(ip: Ipv4Addr, port: u16, seed: u64) -> u32 {
-    let mut hasher = FxHasher::default();
-    hasher.write_u32(u32::from_ne_bytes(ip.octets()));
-    hasher.write_u16(port);
-    hasher.write_u64(seed);
 
-    hasher.finish() as u32
-}
 
-#[inline(always)]
-const fn ipv4_checksum(header: &[u8]) -> u16 {
-    unsafe {
-        core::hint::assert_unchecked(header.len() >= 20);
-    }
-    
-    finalize_checksum(
-        u16::from_be_bytes([header[0], header[1]]) as u32
-            + u16::from_be_bytes([header[2], header[3]]) as u32
-            + u16::from_be_bytes([header[4], header[5]]) as u32
-            + u16::from_be_bytes([header[6], header[7]]) as u32
-            + u16::from_be_bytes([header[8], header[9]]) as u32
-            + u16::from_be_bytes([header[12], header[13]]) as u32
-            + u16::from_be_bytes([header[14], header[15]]) as u32
-            + u16::from_be_bytes([header[16], header[17]]) as u32
-            + u16::from_be_bytes([header[18], header[19]]) as u32
-    )
-}
-
-#[inline(always)]
-const fn finalize_checksum(sum: u32) -> u16 {
-    let sum = (sum >> 16) + (sum & 0xffff);
-    let sum = sum + (sum >> 16);
-
-    !(sum as u16)
-}
-
-#[inline(always)]
-const fn tcp_sum(data: *const u8, len: usize) -> u32 {
-    let mut sum = 0u32;
-    let mut i = 0;
-    while len >= (i + 1) << 1 {
-        sum += u16::from_be(unsafe { *(data.add(i << 1).cast()) }) as u32;
-        
-        i += 1;
-    }
-    
-    if len & 1 != 0 {
-        sum += unsafe { (*(data.add(len - 1))) as u32 } << 8;
-    }
-
-    sum
-}
-
-#[inline(always)]
-const fn tcp_checksum(
-    data: *const u8,
-    len: usize,
-    source: &Ipv4Addr,
-    destination: &Ipv4Addr
-) -> u16 {
-    finalize_checksum(
-        ipv4_word_sum(source)
-            + ipv4_word_sum(destination)
-            + 6
-            + len as u32
-            + tcp_sum(data, len)
-    )
-}
-
-#[inline(always)]
-const fn ipv4_word_sum(ip: &Ipv4Addr) -> u32 {
-    let octets = ip.octets();
-    u16::from_be_bytes([octets[0], octets[1]]) as u32 + u16::from_be_bytes([octets[2], octets[1]]) as u32
-}
-
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::main(flavor = "multi_thread", worker_threads = 20)]
 async fn main() -> Result<(), Errno> {
     env_logger::init();
 
@@ -218,8 +102,8 @@ async fn main() -> Result<(), Errno> {
         )
     };
 
-    let ping_data = Arc::new(build_latest_request(767, "wadescan", 25565));
-    let ping_data_b = ping_data.clone();
+    let ping_data = Arc::new(ping::build_latest_request(767, "wadescan", 25565));
+    let ping_data_len = ping_data.len();
 
     let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
@@ -249,8 +133,8 @@ async fn main() -> Result<(), Errno> {
 
     let seed = rand::random();
 
-    let rng = PerfectRng::new(ranges.count() as u64, seed, 3);
-    let ranges = ranges.into_static();
+    let rng = Arc::new(PerfectRng::new(ranges.count() as u64, seed, 3));
+    let ranges = Arc::new(ranges.into_static());
 
     const UMEM_SIZE: usize = 1 << 21;
     let layout = Layout::from_size_align(UMEM_SIZE, 16384).unwrap();
@@ -278,14 +162,10 @@ async fn main() -> Result<(), Errno> {
         bind_flags: SocketConfig::XDP_BIND_ZEROCOPY  | SocketConfig::XDP_BIND_NEED_WAKEUP,
     })?;
 
-    let mut tx = rxtx.map_tx()?;
-
     umem.bind(&rxtx)?;
 
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Packet>();
-
-    let sender_a = Arc::new(sender);
-    let sender_b = sender_a.clone();
+    let (sender, receiver) = flume::bounded::<Packet>(u16::MAX as usize);
+    let sender_b = sender.clone();
 
     let iface = get_interfaces().into_iter()
         .find(|i| i.name == "eth0").unwrap();
@@ -293,49 +173,11 @@ async fn main() -> Result<(), Errno> {
     let iface_mac = iface.mac_addr.unwrap().octets();
     let source_ip = iface.ipv4.first().unwrap().addr;
 
-    let frame_count = 512usize;
-    let mut frames = (0..frame_count)
-        .map(|i| {
-            let mut frame = umem.frame(BufIdx(i as u32)).unwrap();
-            let base = unsafe { frame.addr.as_mut() };
-
-            let (ether_base, base) = base.split_at_mut(14);
-            {
-                let mut ethernet_packet = MutableEthernetPacket::new(ether_base).unwrap();
-                ethernet_packet.set_destination(MacAddr::from(gateway_mac));
-                ethernet_packet.set_source(MacAddr::from(iface_mac));
-                ethernet_packet.set_ethertype(EtherTypes::Ipv4);
-            }
-
-            let (ipv4_base, base) = base.split_at_mut(20);
-            let mut ipv4_packet = MutableIpv4Packet::new(ipv4_base).unwrap();
-            ipv4_packet.set_version(4);
-            ipv4_packet.set_header_length(5);
-            ipv4_packet.set_dscp(0);
-            ipv4_packet.set_ecn(0);
-            ipv4_packet.set_identification(1);
-            ipv4_packet.set_flags(0b010);
-            ipv4_packet.set_fragment_offset(0);
-            ipv4_packet.set_ttl(64);
-            ipv4_packet.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
-            ipv4_packet.set_source(source_ip);
-            ipv4_packet.set_options(&[]);
-
-            let mut tcp_packet = MutableTcpPacket::new(base).unwrap();
-            tcp_packet.set_source(61000);
-            tcp_packet.set_reserved(0);
-            tcp_packet.set_window(32768);
-            tcp_packet.set_urgent_ptr(0);
-
-            (frame.offset, ipv4_packet, tcp_packet)
-        })
-        .collect::<Vec<_>>();
-
-    let syn_options = [TcpOption::mss(1340), TcpOption::nop(), TcpOption::nop(), TcpOption::sack_perm()];
-    let syn_doff = 5 + (syn_options.iter().map(TcpOptionPacket::packet_size).sum::<usize>() + 3) / 4;
+    let sender_count = 4;
+    let frame_count = 512 / sender_count;
 
     let connections = Arc::new(DashMap::<(Ipv4Addr, u16), ConnectionState, FxBuildHasher>::with_hasher(FxBuildHasher));
-    let reader = tokio::spawn(async move {
+    tokio::spawn(async move {
         let mut ring_buf = AsyncFd::new(ring_buf).unwrap();
         
         loop {
@@ -356,14 +198,14 @@ async fn main() -> Result<(), Errno> {
 
                 match unsafe { (*hdr).ty } {
                     PacketType::SynAck => {
-                        if ack != cookie(ip, port, seed) + 1 {
+                        if ack != checksum::cookie(ip, port, seed) + 1 {
                             debug!("invalid cookie at SYN+ACK");
 
                             continue
                         }
                         
                         sender_b.send(Packet {
-                            ty: PacketType::Ack,
+                            ty: TcpFlags::ACK,
                             ip,
                             port,
                             seq: ack,
@@ -372,7 +214,7 @@ async fn main() -> Result<(), Errno> {
                         }).unwrap();
 
                         sender_b.send(Packet {
-                            ty: PacketType::PshAck,
+                            ty: TcpFlags::PSH | TcpFlags::ACK,
                             ip,
                             port,
                             seq: ack,
@@ -394,7 +236,7 @@ async fn main() -> Result<(), Errno> {
                                 debug!("Got wrong seq number! This is probably because of a re-transmission");
 
                                 sender_b.send(Packet {
-                                    ty: PacketType::Ack,
+                                    ty: TcpFlags::ACK,
                                     ip,
                                     port,
                                     seq: ack,
@@ -411,7 +253,7 @@ async fn main() -> Result<(), Errno> {
 
                             (parse_response(&conn.data), remote_seq)
                         } else {
-                            if ack != cookie(ip, port, seed).wrapping_add((ping_data.len() + 1) as u32) {
+                            if ack != checksum::cookie(ip, port, seed).wrapping_add((ping_data_len + 1) as u32) {
                                 debug!("cookie mismatch when reading data from: {}", ip);
 
                                 continue;
@@ -433,7 +275,7 @@ async fn main() -> Result<(), Errno> {
                         };
 
                         sender_b.send(Packet {
-                            ty: PacketType::Ack,
+                            ty: TcpFlags::ACK,
                             ip,
                             port,
                             seq: ack,
@@ -446,7 +288,7 @@ async fn main() -> Result<(), Errno> {
                             println!("{}", data_string);
 
                             sender_b.send(Packet {
-                                ty: PacketType::Fin,
+                                ty: TcpFlags::FIN,
                                 ip,
                                 port,
                                 seq: ack,
@@ -459,7 +301,7 @@ async fn main() -> Result<(), Errno> {
                     PacketType::Fin => {
                         if let Some(mut conn) = connections.get_mut(&addr) {
                             sender_b.send(Packet {
-                                ty: PacketType::Ack,
+                                ty: TcpFlags::ACK,
                                 ip,
                                 port,
                                 seq: conn.local_seq,
@@ -469,7 +311,7 @@ async fn main() -> Result<(), Errno> {
 
                             if !conn.fin_sent {
                                 sender_b.send(Packet {
-                                    ty: PacketType::Fin,
+                                    ty: TcpFlags::FIN,
                                     ip,
                                     port,
                                     seq: conn.local_seq,
@@ -485,7 +327,7 @@ async fn main() -> Result<(), Errno> {
                             }
                         } else {
                             sender_b.send(Packet {
-                                ty: PacketType::Ack,
+                                ty: TcpFlags::ACK,
                                 ip,
                                 port,
                                 seq: ack,
@@ -540,97 +382,144 @@ async fn main() -> Result<(), Errno> {
         }
     });
 
-    tokio::spawn(async move {
-        let mut frame = 0;
+    for n in 0..sender_count {
+        let mut tx = rxtx.map_tx()?;
+        
+        let offset = n * frame_count;
+        let mut frames = (0..frame_count)
+            .map(|i| {
+                let mut frame = umem.frame(BufIdx((offset + i) as u32)).unwrap();
+                let base = unsafe { frame.addr.as_mut() };
 
-        while let Some(Packet { ty, ip, port, seq, ack, ping }) = receiver.recv().await {
-            let (offset, ipv4_packet, tcp_packet) = frames.get_mut(frame).unwrap();
-
-            frame += 1;
-            if frame >= frame_count {
-                frame = 0;
-            }
-
-            let len = {
-                let tcp_packet_len = if ty == PacketType::Syn {
-                    syn_doff * 4
-                } else { 20 } + if ping {
-                    ping_data_b.len()
-                } else { 0 };
-
-                let ipv4_len = 20 + tcp_packet_len;
-                ipv4_packet.set_destination(ip);
-                ipv4_packet.set_total_length(ipv4_len as u16);
-                ipv4_packet.set_checksum(
-                    ipv4_checksum(ipv4_packet.packet())
-                );
-
-                if ty == PacketType::Syn {
-                    tcp_packet.set_data_offset(syn_doff as u8);
-                    tcp_packet.set_options(&syn_options);
-                } else {
-                    tcp_packet.set_data_offset(5);
-                    tcp_packet.set_options(&[]);
+                let (ether_base, base) = base.split_at_mut(14);
+                {
+                    let mut ethernet_packet = MutableEthernetPacket::new(ether_base).unwrap();
+                    ethernet_packet.set_destination(MacAddr::from(gateway_mac));
+                    ethernet_packet.set_source(MacAddr::from(iface_mac));
+                    ethernet_packet.set_ethertype(EtherTypes::Ipv4);
                 }
 
-                tcp_packet.set_checksum(0);
-                tcp_packet.set_destination(port);
-                tcp_packet.set_sequence(seq);
-                tcp_packet.set_acknowledgement(ack);
-                tcp_packet.set_flags(match ty {
-                    PacketType::Syn => TcpFlags::SYN,
-                    PacketType::Ack => TcpFlags::ACK,
-                    PacketType::Fin => TcpFlags::FIN,
-                    PacketType::PshAck => TcpFlags::PSH | TcpFlags::ACK,
+                let (ipv4_base, base) = base.split_at_mut(20);
+                let mut ipv4_packet = MutableIpv4Packet::new(ipv4_base).unwrap();
+                ipv4_packet.set_version(4);
+                ipv4_packet.set_header_length(5);
+                ipv4_packet.set_dscp(0);
+                ipv4_packet.set_ecn(0);
+                ipv4_packet.set_identification(1);
+                ipv4_packet.set_flags(0b010);
+                ipv4_packet.set_fragment_offset(0);
+                ipv4_packet.set_ttl(64);
+                ipv4_packet.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
+                ipv4_packet.set_source(source_ip);
+                ipv4_packet.set_options(&[]);
 
-                    _ => unreachable!()
-                });
+                let mut tcp_packet = MutableTcpPacket::new(base).unwrap();
+                tcp_packet.set_source(61000);
+                tcp_packet.set_reserved(0);
+                tcp_packet.set_window(32768);
+                tcp_packet.set_urgent_ptr(0);
 
-                if ping {
-                    tcp_packet.set_payload(&ping_data_b);
+                (frame.offset, ipv4_packet, tcp_packet)
+            })
+            .collect::<Vec<_>>();
+
+        let ping_data = ping_data.clone();
+        let receiver = receiver.clone();
+        tokio::spawn(async move {
+            let mut frame = 0;
+
+            while let Ok(Packet { ty, ip, port, seq, ack, ping }) = receiver.recv_async().await {
+                let (offset, ipv4_packet, tcp_packet) = frames.get_mut(frame).unwrap();
+
+                frame += 1;
+                if frame >= frame_count {
+                    frame = 0;
                 }
 
-                tcp_packet.set_checksum(tcp_checksum(tcp_packet.packet().as_ptr(), tcp_packet_len, &source_ip, &ip));
+                let len;
+                {
+                    let tcp_packet_len = if ty == TcpFlags::SYN {
+                        tcp_packet.set_data_offset(7);
+                        tcp_packet.set_options(&[TcpOption::mss(1340), TcpOption::nop(), TcpOption::nop(), TcpOption::sack_perm()]);
 
-                ipv4_len + 14
-            };
+                        28
+                    } else {
+                        tcp_packet.set_data_offset(5);
+                        tcp_packet.set_options(&[]);
 
-            {
-                let mut writer = tx.transmit(1);
-                writer.insert_once(XdpDesc {
-                    addr: *offset,
-                    len: len as u32,
-                    options: 0
-                });
+                        20
+                    } + if ping { ping_data_len } else { 0 };
 
-                writer.commit();
+                    let total_len = 20 + tcp_packet_len;
+                    len = 14 + total_len;
+
+                    ipv4_packet.set_destination(ip);
+                    ipv4_packet.set_total_length(total_len as u16);
+                    ipv4_packet.set_checksum(
+                        checksum::ipv4(ipv4_packet.packet())
+                    );
+
+                    tcp_packet.set_checksum(0);
+                    tcp_packet.set_destination(port);
+                    tcp_packet.set_sequence(seq);
+                    tcp_packet.set_acknowledgement(ack);
+                    tcp_packet.set_flags(ty);
+
+                    if ping {
+                        tcp_packet.set_payload(&ping_data);
+                    }
+
+                    tcp_packet.set_checksum(checksum::tcp(tcp_packet.packet().as_ptr(), tcp_packet_len, &source_ip, &ip));
+                };
+
+                {
+                    let mut writer = tx.transmit(1);
+                    writer.insert_once(XdpDesc {
+                        addr: *offset,
+                        len: len as u32,
+                        options: 0
+                    });
+                    
+                    writer.commit();
+                }
+
+                if tx.needs_wakeup() {
+                    tx.wake();
+                }
             }
-
-            if tx.needs_wakeup() {
-                tx.wake();
-            }
-        }
-    });
-
-    for n in 0..ranges.count {
-        let shuffled_index = rng.shuffle(n as u64);
-        let dest = ranges.index(shuffled_index as usize);
-
-        let ip = dest.0;
-        let port = dest.1;
-
-        sender_a.send(Packet {
-            ty: PacketType::Syn,
-            ip,
-            port,
-            seq: cookie(ip, port, seed),
-            ack: 0,
-            ping: false
-        }).unwrap();
+        });
     }
 
-    println!("Finished scanning...");
-    reader.await.unwrap();
+    let packet_calculator_count = 16;
+    let packets_per_calculator = ranges.count / packet_calculator_count;
 
-    Ok(())
+    for i in 0..packet_calculator_count {
+        let rng = rng.clone();
+        let ranges = ranges.clone();
+        let sender_a = sender.clone();
+
+        let offset = i * packets_per_calculator;
+        tokio::spawn(async move {
+            for n in 0..packets_per_calculator {
+                let shuffled_index = rng.shuffle((offset + n) as u64);
+                let dest = ranges.index(shuffled_index as usize);
+
+                let ip = dest.0;
+                let port = dest.1;
+
+                sender_a.send(Packet {
+                    ty: TcpFlags::SYN,
+                    ip,
+                    port,
+                    seq: checksum::cookie(ip, port, seed),
+                    ack: 0,
+                    ping: false
+                }).unwrap();
+            }
+        });
+    }
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
 }
