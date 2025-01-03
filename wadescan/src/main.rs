@@ -204,23 +204,23 @@ async fn main() -> Result<(), Errno> {
                             continue
                         }
                         
-                        sender_b.send(Packet {
+                        _ = sender_b.send_async(Packet {
                             ty: TcpFlags::ACK,
                             ip,
                             port,
                             seq: ack,
                             ack: seq + 1,
                             ping: false
-                        }).unwrap();
+                        }).await;
 
-                        sender_b.send(Packet {
+                        _ = sender_b.send_async(Packet {
                             ty: TcpFlags::PSH | TcpFlags::ACK,
                             ip,
                             port,
                             seq: ack,
                             ack: seq + 1,
                             ping: true
-                        }).unwrap();
+                        }).await;
                     }
 
                     PacketType::Ack => {
@@ -235,14 +235,14 @@ async fn main() -> Result<(), Errno> {
                             if seq != conn.remote_seq {
                                 debug!("Got wrong seq number! This is probably because of a re-transmission");
 
-                                sender_b.send(Packet {
+                                sender_b.send_async(Packet {
                                     ty: TcpFlags::ACK,
                                     ip,
                                     port,
                                     seq: ack,
                                     ack: conn.remote_seq,
                                     ping: false
-                                }).unwrap();
+                                }).await;
 
                                 continue;
                             }
@@ -274,50 +274,50 @@ async fn main() -> Result<(), Errno> {
                             (parse_response(data), remote_seq)
                         };
 
-                        sender_b.send(Packet {
+                        _ = sender_b.send_async(Packet {
                             ty: TcpFlags::ACK,
                             ip,
                             port,
                             seq: ack,
                             ack: remote_seq,
                             ping: false
-                        }).unwrap();
+                        }).await;
 
                         if let Some(data) = ping_response {
                             let data_string = String::from_utf8_lossy(&data);
                             println!("{}", data_string);
 
-                            sender_b.send(Packet {
+                            _ = sender_b.send_async(Packet {
                                 ty: TcpFlags::FIN,
                                 ip,
                                 port,
                                 seq: ack,
                                 ack: remote_seq,
                                 ping: false
-                            }).unwrap();
+                            }).await;
                         }
                     }
 
                     PacketType::Fin => {
                         if let Some(mut conn) = connections.get_mut(&addr) {
-                            sender_b.send(Packet {
+                            _ = sender_b.send_async(Packet {
                                 ty: TcpFlags::ACK,
                                 ip,
                                 port,
                                 seq: conn.local_seq,
                                 ack: seq + 1,
                                 ping: false
-                            }).unwrap();
+                            }).await;
 
                             if !conn.fin_sent {
-                                sender_b.send(Packet {
+                                _ = sender_b.send_async(Packet {
                                     ty: TcpFlags::FIN,
                                     ip,
                                     port,
                                     seq: conn.local_seq,
                                     ack: seq + 1,
                                     ping: false
-                                }).unwrap();
+                                }).await;
 
                                 conn.fin_sent = true;
                             }
@@ -326,14 +326,14 @@ async fn main() -> Result<(), Errno> {
                                 connections.remove(&addr);
                             }
                         } else {
-                            sender_b.send(Packet {
+                            _ = sender_b.send_async(Packet {
                                 ty: TcpFlags::ACK,
                                 ip,
                                 port,
                                 seq: ack,
                                 ack: seq + 1,
                                 ping: false
-                            }).unwrap();
+                            }).await;
                         }
                     }
 
@@ -490,7 +490,7 @@ async fn main() -> Result<(), Errno> {
         });
     }
 
-    let packet_calculator_count = 16;
+    let packet_calculator_count = 8;
     let packets_per_calculator = ranges.count / packet_calculator_count;
 
     for i in 0..packet_calculator_count {
@@ -507,14 +507,14 @@ async fn main() -> Result<(), Errno> {
                 let ip = dest.0;
                 let port = dest.1;
 
-                sender_a.send(Packet {
+                _ = sender_a.send_async(Packet {
                     ty: TcpFlags::SYN,
                     ip,
                     port,
                     seq: checksum::cookie(ip, port, seed),
                     ack: 0,
                     ping: false
-                }).unwrap();
+                }).await;
             }
         });
     }
