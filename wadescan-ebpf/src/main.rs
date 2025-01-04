@@ -68,10 +68,12 @@ fn try_receive(ctx: XdpContext) -> Result<u32, ()> {
                     return Ok(XDP_PASS)
                 } else if unsafe { (*tcp_hdr).fin() } != 0 {
                     PacketType::Fin
-                } else if unsafe { (*tcp_hdr).syn() } != 0 && unsafe { (*tcp_hdr).ack() } != 0 {
-                    PacketType::SynAck
                 } else if unsafe { (*tcp_hdr).ack() } != 0 {
-                    PacketType::Ack
+                    if unsafe { (*tcp_hdr).syn() } != 0 {
+                        PacketType::SynAck
+                    } else {
+                        PacketType::Ack
+                    }
                 } else { return Ok(XDP_PASS) }
             },
             ip,

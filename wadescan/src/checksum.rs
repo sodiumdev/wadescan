@@ -32,15 +32,19 @@ pub const fn ipv4(header: &[u8]) -> u16 {
 }
 
 #[inline(always)]
+const fn finalize_checksum(sum: u32) -> u16 {
+    let sum = (sum >> 16) + (sum & 0xffff);
+    let sum = sum + (sum >> 16);
+
+    !(sum as u16)
+}
+
+#[inline(always)]
 const fn tcp_sum(data: *const u8, len: usize) -> u32 {
-    unsafe {
-        core::hint::assert_unchecked(!data.is_null());
-    }
-    
     let mut sum = 0u32;
     let mut i = 0;
-    while len >= (i + 1) << 1 {
-        sum += u16::from_be(unsafe { *(data.add(i << 1).cast()) }) as u32;
+    while (i * 2) + 1 < len {
+        sum += u16::from_be(unsafe { data.add(i * 2).cast::<u16>().read_unaligned() }) as u32;
 
         i += 1;
     }
@@ -55,7 +59,7 @@ const fn tcp_sum(data: *const u8, len: usize) -> u32 {
 #[inline(always)]
 const fn ipv4_word_sum(ip: &Ipv4Addr) -> u32 {
     let octets = ip.octets();
-    u16::from_be_bytes([octets[0], octets[1]]) as u32 
+    u16::from_be_bytes([octets[0], octets[1]]) as u32
         + u16::from_be_bytes([octets[2], octets[3]]) as u32
 }
 
@@ -73,12 +77,4 @@ pub const fn tcp(
             + len as u32
             + tcp_sum(data, len)
     )
-}
-
-#[inline(always)]
-const fn finalize_checksum(sum: u32) -> u16 {
-    let sum = (sum >> 16) + (sum & 0xffff);
-    let sum = sum + (sum >> 16);
-
-    !(sum as u16)
 }

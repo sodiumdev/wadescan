@@ -21,8 +21,14 @@ rustc-hash = "2.1.0"
 log = "0.4.22"
 pnet_packet = "0.35.0"
 pnet_base = "0.35.0"
-network-types = "0.0.7"
 flume = "0.11.1"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "bench"
+harness = false
 
 [build-dependencies]
 anyhow = { workspace = true }
