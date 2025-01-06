@@ -1,6 +1,7 @@
 use std::net::Ipv4Addr;
 use std::slice::from_raw_parts;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use aya::maps::{MapData, RingBuf};
 use dashmap::DashMap;
 use flume::Sender;
@@ -11,7 +12,7 @@ use tokio::io::unix::AsyncFd;
 use wadescan_common::{PacketHeader, PacketType};
 use crate::{checksum, ping, Packet};
 
-struct ConnectionState {
+pub struct ConnectionState {
     data: Vec<u8>,
     started: Instant,
 
@@ -21,29 +22,31 @@ struct ConnectionState {
     fin_sent: bool,
 }
 
+pub type ConnectionMap = Arc<DashMap<(Ipv4Addr, u16), ConnectionState, FxBuildHasher>>;
+
 pub struct Responder {
-    connections: DashMap<(Ipv4Addr, u16), ConnectionState, FxBuildHasher>,
+    connections: ConnectionMap,
     sender: Sender<Packet>,
     
     fd: AsyncFd<RingBuf<MapData>>,
     seed: u64,
     
-    ping_data: &'static [u8]
+    ping_data: &'static [u8],
 }
 
 impl Responder {
     #[inline]
-    pub fn new(seed: u64, ring_buf: RingBuf<MapData>, sender: Sender<Packet>, ping_data: &'static [u8]) -> Option<Self> {
+    pub fn new(connections: ConnectionMap, seed: u64, ring_buf: RingBuf<MapData>, sender: Sender<Packet>, ping_data: &'static [u8]) -> Option<Self> {
         let fd = AsyncFd::new(ring_buf).ok()?;
 
         Some(Self {
-            connections: DashMap::with_hasher(FxBuildHasher),
+            connections,
             sender,
             
             fd,
             seed,
 
-            ping_data
+            ping_data,
         })
     }
 
@@ -211,5 +214,29 @@ impl Responder {
         guard.clear_ready();
         
         Some(())
+    }
+}
+
+pub struct Purger {
+    connections: ConnectionMap,
+    purge_interval: Duration,
+    ping_timeout: Duration,
+}
+
+impl Purger {
+    #[inline]
+    pub fn new(connections: ConnectionMap, purge_interval: Duration, ping_timeout: Duration) -> Self {
+        Self {
+            connections,
+            purge_interval,
+            ping_timeout
+        }
+    }
+    
+    #[inline]
+    pub async fn tick(&self) {
+        self.connections.retain(|_, conn| conn.started.elapsed() <= self.ping_timeout);
+        
+        tokio::time::sleep(self.purge_interval).await;
     }
 }

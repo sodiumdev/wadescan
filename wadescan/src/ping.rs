@@ -1,5 +1,3 @@
-use std::io::{Cursor, Read};
-
 #[repr(u8)]
 pub enum PingError {
     Invalid,

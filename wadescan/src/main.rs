@@ -1,4 +1,4 @@
-#![feature(const_vec_string_slice)]
+#![feature(const_vec_string_slice, variant_count)]
 
 pub mod range;
 pub mod excludefile;
@@ -7,25 +7,29 @@ pub mod ping;
 pub mod responder;
 pub mod sender;
 pub mod completer;
+pub mod mode;
+mod scanner;
 
 use crate::completer::{PacketCompleter, Printer};
-use crate::range::{ScanRange, ScanRanges};
-use crate::responder::Responder;
+use crate::responder::{Purger, Responder};
 use crate::sender::{PacketSender, WrappedTx};
 use aya::maps::RingBuf;
 use aya::programs::{Xdp, XdpFlags};
 use default_net::get_interfaces;
-use perfect_rand::PerfectRng;
-use pnet_packet::tcp::{TcpFlags};
 use std::alloc::{alloc, Layout};
+use std::env;
 use std::net::Ipv4Addr;
 use std::num::NonZeroU32;
 use std::ptr::NonNull;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::{Duration};
+use dashmap::DashMap;
+use diesel::{Connection, PgConnection};
+use rustc_hash::FxBuildHasher;
 use tokio::sync::RwLock;
 use xdpilone::{Errno, IfInfo, Socket, SocketConfig, Umem, UmemConfig};
+use crate::scanner::Scanner;
 
 #[repr(C, packed)]
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
@@ -66,24 +70,10 @@ async fn main() -> Result<(), Errno> {
     program.load().unwrap();
     program.attach("eth0", XdpFlags::SKB_MODE).unwrap();
 
-    let ping_data: &'static [u8] = ping::build_latest_request(767, "wadescan", 25565).leak();
-
-    let mut ranges = ScanRanges::new();
-    ranges.extend(vec![ScanRange::single_port(
-        Ipv4Addr::new(0, 0, 0, 0),
-        Ipv4Addr::new(255, 255, 255, 255),
-        25565,
-    )]);
-
-    {
-        let excludes = excludefile::parse_file("exclude.conf").expect("Error parsing excludefile");
-        ranges.apply_exclude(&excludes);
-    }
+    let excludefile = excludefile::parse_file("exclude.conf").expect("Error parsing excludefile");
+    let ping_data: &[u8] = ping::build_latest_request(767, "wadescan", 25565).leak();
 
     let seed = rand::random();
-
-    let rng = Arc::new(PerfectRng::new(ranges.count() as u64, seed, 3));
-    let ranges = Arc::new(ranges.into_static());
 
     const UMEM_SIZE: usize = 1 << 30;
     let layout = Layout::from_size_align(UMEM_SIZE, 16384).unwrap();
@@ -116,22 +106,17 @@ async fn main() -> Result<(), Errno> {
     let (sender, receiver) = flume::bounded::<Packet>(u16::MAX as usize);
     let sender_completer = sender.clone();
 
-    let iface = get_interfaces().into_iter()
-        .find(|i| i.name == "eth0").unwrap();
-    let gateway_mac = iface.gateway.unwrap().mac_addr.octets();
-    let iface_mac = iface.mac_addr.unwrap().octets();
-    let source_ip = iface.ipv4.first().unwrap().addr;
-
-    let completed = Arc::new(AtomicUsize::new(0));
-    let completed_printer = completed.clone();
+    let connections = Arc::new(DashMap::with_hasher(FxBuildHasher));
+    let connections_purger = connections.clone();
 
     tokio::spawn(async move {
         let mut responder = Responder::new(
+            connections,
             seed,
             ring_buf,
             sender_completer,
             ping_data
-        ).unwrap();
+        ).expect("Error initiating responder");
 
         loop {
             if responder.tick().await.is_none() {
@@ -139,6 +124,21 @@ async fn main() -> Result<(), Errno> {
             }
         }
     });
+
+    tokio::spawn(async move {
+        let purger = Purger::new(
+            connections_purger,
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+
+        loop {
+            purger.tick().await;
+        }
+    });
+
+    let completed = Arc::new(AtomicUsize::new(0));
+    let completed_printer = completed.clone();
 
     tokio::spawn(async move {
         let mut printer = Printer::new(completed_printer, Duration::from_secs(5));
@@ -156,11 +156,16 @@ async fn main() -> Result<(), Errno> {
         }
     });
 
+    let tx = Arc::new(RwLock::new(WrappedTx(rxtx.map_tx()?)));
+    let iface = get_interfaces().into_iter()
+        .find(|i| i.name == "eth0").unwrap();
+    let gateway_mac = iface.gateway.unwrap().mac_addr.octets();
+    let iface_mac = iface.mac_addr.unwrap().octets();
+    let source_ip = iface.ipv4.first().unwrap().addr;
+
     let sender_count = 4;
     let frame_count = 512 / sender_count;
 
-    let tx = Arc::new(RwLock::new(WrappedTx(rxtx.map_tx()?)));
-    
     for n in 0..sender_count {
         let receiver = receiver.clone();
         let frames = PacketSender::generate_frames(n, frame_count, &umem, &iface_mac, &gateway_mac, source_ip, ping_data);
@@ -173,7 +178,7 @@ async fn main() -> Result<(), Errno> {
                 tx,
                 receiver,
                 ping_data
-            ).unwrap();
+            ).expect("Error initiating packet sender");
 
             loop {
                 sender.tick().await;
@@ -181,36 +186,11 @@ async fn main() -> Result<(), Errno> {
         });
     }
 
-    let packet_calculator_count = 8;
-    let packets_per_calculator = ranges.count / packet_calculator_count;
+    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let db = PgConnection::establish(&database_url).expect("Error connecting to database");
 
-    for i in 0..packet_calculator_count {
-        let rng = rng.clone();
-        let ranges = ranges.clone();
-        let sender = sender.clone();
-
-        let offset = i * packets_per_calculator;
-        tokio::spawn(async move {
-            for n in 0..packets_per_calculator {
-                let shuffled_index = rng.shuffle((offset + n) as u64);
-                let dest = ranges.index(shuffled_index as usize);
-
-                let ip = dest.0;
-                let port = dest.1;
-
-                sender.send_async(Packet {
-                    ty: TcpFlags::SYN,
-                    ip,
-                    port,
-                    seq: checksum::cookie(ip, port, seed),
-                    ack: 0,
-                    ping: false
-                }).await.unwrap();
-            }
-        });
-    }
-
+    let mut scanner = Scanner::new(db, seed, excludefile, sender);
     loop {
-        tokio::time::sleep(Duration::from_secs(10)).await; // to avoid busy-waiting
+        scanner.tick();
     }
 }
