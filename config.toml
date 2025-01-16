@@ -1,7 +1,7 @@
 [database]
-url = "AH FUCK NO I LEAKED IT"
-name = "servers"
-collection_name = "servers"
+url = "ur mongodb url here"
+name = "name of le database"
+collection_name = "name of le collection"
 
 [ping]
 address = "wadescan"
@@ -20,7 +20,7 @@ secs = 60
 nanos = 0
 
 [printer.interval]
-secs = 5
+secs = 60
 nanos = 0
 
 [sender]
