@@ -14,7 +14,7 @@ libc = { workspace = true }
 xdpilone = { workspace = true, default-features = true }
 dashmap = { workspace = true, default-features = true }
 default-net = { workspace = true, default-features = true }
-rand = { workspace = true, default-features = true }
+rand = { workspace = true, features = ["default", "serde"] }
 perfect_rand = { workspace = true, default-features = true }
 tokio = { workspace = true, features = ["full"] }
 rustc-hash = "2.1.0"
