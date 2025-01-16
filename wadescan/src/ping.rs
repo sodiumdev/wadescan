@@ -51,10 +51,10 @@ fn write_varint(writer: &mut Vec<u8>, mut value: i32) {
 }
 
 #[inline(always)]
-fn read_varint(ip: &mut usize, buffer: &[u8]) -> i32 {
+fn read_varint(ip: &mut usize, buffer: &[u8]) -> Option<i32> {
     let mut res = 0;
     for i in 0..5 {
-        let byte = buffer[*ip];
+        let byte = buffer.get(*ip)?;
         *ip += 1;
 
         res |= ((byte & 0b0111_1111) as i32) << (7 * i);
@@ -63,14 +63,14 @@ fn read_varint(ip: &mut usize, buffer: &[u8]) -> i32 {
         }
     }
 
-    res
+    Some(res)
 }
 
 #[inline(always)]
 pub fn parse_response(response: &[u8]) -> Result<Vec<u8>, PingError> {
     let mut ip = 0;
     for _ in 0..5 {
-        let byte = response[ip];
+        let byte = response.get(ip).ok_or(PingError::Invalid)?;
         ip += 1;
 
         if byte & 0b1000_0000 == 0 {
@@ -78,8 +78,8 @@ pub fn parse_response(response: &[u8]) -> Result<Vec<u8>, PingError> {
         }
     }
 
-    let packet_id = read_varint(&mut ip, response);
-    let response_length = read_varint(&mut ip, response);
+    let packet_id = read_varint(&mut ip, response).ok_or(PingError::Invalid)?;
+    let response_length = read_varint(&mut ip, response).ok_or(PingError::Invalid)?;
     if packet_id != 0x00 || response_length < 0 {
         return Err(PingError::Invalid)
     }
