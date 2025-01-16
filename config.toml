@@ -1,0 +1,27 @@
+[database]
+url = "ur mongodb url here"
+name = "name of le database"
+collection_name = "name of le collection"
+
+[ping]
+address = "wadescan"
+port = 3169
+protocol_version = 767
+
+[scanner]
+interface_name = "eth0"
+
+[purger.interval]
+secs = 60
+nanos = 0
+
+[purger.timeout]
+secs = 60
+nanos = 0
+
+[printer.interval]
+secs = 60
+nanos = 0
+
+[sender]
+threads = 4

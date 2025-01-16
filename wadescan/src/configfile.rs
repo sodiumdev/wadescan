@@ -1,8 +1,8 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::time::Duration;
 
-#[derive(Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct Configfile {
     pub database: DatabaseConfig,
     pub ping: PingConfig,
@@ -12,37 +12,37 @@ pub struct Configfile {
     pub sender: SenderConfig,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct DatabaseConfig {
     pub url: String,
     pub name: String,
     pub collection_name: String
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct PingConfig {
     pub address: String,
     pub port: u16,
     pub protocol_version: i32
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct ScannerConfig {
     pub interface_name: String
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct PurgerConfig {
     pub interval: Duration,
     pub timeout: Duration
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct PrinterConfig {
     pub interval: Duration
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct SenderConfig {
     pub threads: usize
 }

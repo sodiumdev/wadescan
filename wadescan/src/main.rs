@@ -32,6 +32,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use xdpilone::{Errno, IfInfo, Socket, SocketConfig, Umem, UmemConfig};
+use crate::configfile::Configfile;
 
 #[repr(C, packed)]
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
