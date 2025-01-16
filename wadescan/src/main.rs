@@ -113,7 +113,7 @@ async fn main() -> Result<(), Errno> {
 
     umem.bind(&rxtx)?;
 
-    let (sender, receiver) = flume::bounded::<Packet>(u16::MAX as usize);
+    let (sender, receiver) = flume::unbounded::<Packet>();
     let sender_completer = sender.clone();
 
     let connections = Arc::new(DashMap::with_hasher(FxBuildHasher));
