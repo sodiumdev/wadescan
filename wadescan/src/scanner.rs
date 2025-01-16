@@ -52,7 +52,7 @@ impl Scanner {
             ranges.count as u64,
             1_000_000 * 60 /* 1000 KPPS for 60 seconds */
         );
-        
+
         (0..packet_count).into_par_iter().for_each(|n| {
             let shuffled_index = rng.shuffle(n);
             let dest = ranges.index(shuffled_index as usize);
