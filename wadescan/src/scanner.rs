@@ -1,5 +1,6 @@
-use diesel::PgConnection;
 use flume::Sender;
+use mongodb::bson::Document;
+use mongodb::Collection;
 use rayon::iter::ParallelIterator;
 use perfect_rand::PerfectRng;
 use pnet_packet::tcp::TcpFlags;
@@ -9,40 +10,40 @@ use crate::{checksum, Packet};
 use crate::range::{Ipv4Ranges, ScanRanges};
 
 pub struct Scanner {
-    db: PgConnection,
-    
     seed: u64,
     excludes: Ipv4Ranges,
 
     mode_picker: ModePicker,
     mode: ScanMode,
 
-    sender: Sender<Packet>
+    sender: Sender<Packet>,
+
+    collection: Collection<Document>
 }
 
 impl Scanner {
     #[inline]
-    pub fn new(db: PgConnection, seed: u64, excludes: Ipv4Ranges, sender: Sender<Packet>) -> Self {
+    pub fn new(collection: Collection<Document>, seed: u64, excludes: Ipv4Ranges, sender: Sender<Packet>) -> Self {
         let mode_picker = ModePicker::default();
         let mode = mode_picker.pick();
 
         Self {
-            db,
-            
             seed,
             excludes,
 
             mode_picker,
             mode,
 
-            sender
+            sender,
+            
+            collection
         }
     }
 
     #[inline]
     pub fn tick(&mut self) {
         let ranges = ScanRanges::from_except(
-            self.mode.ranges(),
+            self.mode.ranges(&self.collection),
             &self.excludes,
         ).into_static();
 

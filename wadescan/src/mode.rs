@@ -2,6 +2,8 @@
 
 use std::net::Ipv4Addr;
 use std::str::FromStr;
+use mongodb::bson::Document;
+use mongodb::Collection;
 use rand::distr::{Distribution, WeightedIndex};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap};
@@ -17,6 +19,7 @@ macro_rules! scan_mode {
         }
 
         impl ScanMode {
+            #[inline]
             pub const fn name(&self) -> &'static str {
                 match self {
                     $(Self::$variant => stringify!($variant)),*
@@ -27,6 +30,7 @@ macro_rules! scan_mode {
         impl FromStr for ScanMode {
             type Err = ();
             
+            #[inline]
             fn from_str(s: &str) -> Result<Self, Self::Err> {
                 Ok(match s {
                     $(stringify!($variant) => Self::$variant),*,
@@ -65,7 +69,7 @@ scan_mode!(
 
 impl ScanMode {
     #[inline]
-    pub fn ranges(&self) -> Vec<ScanRange> {
+    pub fn ranges(&self, collection: &Collection<Document>) -> Vec<ScanRange> {
         match self {
             ScanMode::Slash0FewPorts => unimplemented!(),
             ScanMode::Slash0FilteredByAsn => unimplemented!(),

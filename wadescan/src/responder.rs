@@ -6,11 +6,14 @@ use aya::maps::{MapData, RingBuf};
 use dashmap::DashMap;
 use flume::Sender;
 use log::debug;
+use mongodb::bson::Document;
+use mongodb::Collection;
 use pnet_packet::tcp::TcpFlags;
 use rustc_hash::FxBuildHasher;
 use tokio::io::unix::AsyncFd;
 use wadescan_common::{PacketHeader, PacketType};
 use crate::{checksum, ping, Packet};
+use crate::ping::{RawLatest, Response};
 
 pub struct ConnectionState {
     data: Vec<u8>,
@@ -25,6 +28,8 @@ pub struct ConnectionState {
 pub type ConnectionMap = Arc<DashMap<(Ipv4Addr, u16), ConnectionState, FxBuildHasher>>;
 
 pub struct Responder {
+    collection: Collection<Document>,
+
     connections: ConnectionMap,
     sender: Sender<Packet>,
     
@@ -36,10 +41,11 @@ pub struct Responder {
 
 impl Responder {
     #[inline]
-    pub fn new(connections: ConnectionMap, seed: u64, ring_buf: RingBuf<MapData>, sender: Sender<Packet>, ping_data: &'static [u8]) -> Option<Self> {
+    pub fn new(collection: Collection<Document>, connections: ConnectionMap, seed: u64, ring_buf: RingBuf<MapData>, sender: Sender<Packet>, ping_data: &'static [u8]) -> Option<Self> {
         let fd = AsyncFd::new(ring_buf).ok()?;
 
         Some(Self {
+            collection,
             connections,
             sender,
             
@@ -154,8 +160,13 @@ impl Responder {
                     }).await;
 
                     if let Ok(data) = ping_response {
-                        let data_string = String::from_utf8_lossy(&data);
-                        println!("{}", data_string);
+                        if let Ok(mut response) = serde_json::from_slice::<RawLatest>(&data) {
+                            response.raw_json = data;
+                            
+                            if let Ok(response) = TryInto::<Response>::try_into(response) {
+                                println!("{response:?}");
+                            }
+                        }
 
                         _ = self.sender.send_async(Packet {
                             ty: TcpFlags::FIN | TcpFlags::ACK,

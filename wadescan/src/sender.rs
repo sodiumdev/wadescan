@@ -19,6 +19,12 @@ pub struct WrappedTx(pub RingTx);
 unsafe impl Send for WrappedTx {}
 unsafe impl Sync for WrappedTx {}
 
+impl From<RingTx> for WrappedTx {
+    fn from(value: RingTx) -> Self {
+        Self(value)
+    }
+}
+
 pub struct PacketSender<'a> {
     frames: Vec<Frame<'a>>,
     frame: usize,

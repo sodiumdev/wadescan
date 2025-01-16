@@ -9,27 +9,29 @@ pub mod sender;
 pub mod completer;
 pub mod mode;
 mod scanner;
+mod configfile;
+mod database;
 
 use crate::completer::{PacketCompleter, Printer};
 use crate::responder::{Purger, Responder};
-use crate::sender::{PacketSender, WrappedTx};
+use crate::scanner::Scanner;
+use crate::sender::PacketSender;
 use aya::maps::RingBuf;
 use aya::programs::{Xdp, XdpFlags};
+use dashmap::DashMap;
 use default_net::get_interfaces;
+use mongodb::Client;
+use rustc_hash::FxBuildHasher;
 use std::alloc::{alloc, Layout};
 use std::env;
+use std::ffi::CString;
 use std::net::Ipv4Addr;
 use std::num::NonZeroU32;
 use std::ptr::NonNull;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
-use std::time::{Duration};
-use dashmap::DashMap;
-use diesel::{Connection, PgConnection};
-use rustc_hash::FxBuildHasher;
 use tokio::sync::RwLock;
 use xdpilone::{Errno, IfInfo, Socket, SocketConfig, Umem, UmemConfig};
-use crate::scanner::Scanner;
 
 #[repr(C, packed)]
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
@@ -66,12 +68,19 @@ async fn main() -> Result<(), Errno> {
 
     _ = aya_log::EbpfLogger::init(&mut ebpf);
 
+    let excludefile = excludefile::parse_file("exclude.conf").expect("Error parsing excludefile");
+    let configfile = configfile::parse_file("config.toml").expect("Error parsing configfile");
+
     let program: &mut Xdp = ebpf.program_mut("wadescan").unwrap().try_into().unwrap();
     program.load().unwrap();
-    program.attach("eth0", XdpFlags::SKB_MODE).unwrap();
+    program.attach(&configfile.scanner.interface_name, XdpFlags::SKB_MODE).unwrap();
 
-    let excludefile = excludefile::parse_file("exclude.conf").expect("Error parsing excludefile");
-    let ping_data: &[u8] = ping::build_latest_request(767, "wadescan", 25565).leak();
+    let ping_config = configfile.ping;
+    let ping_data: &[u8] = ping::build_latest_request(
+        ping_config.protocol_version,
+        &ping_config.address,
+        ping_config.port
+    ).leak();
 
     let seed = rand::random();
 
@@ -90,7 +99,7 @@ async fn main() -> Result<(), Errno> {
     };
 
     let mut iface = IfInfo::invalid();
-    iface.from_name(c"eth0")?;
+    iface.from_name(&CString::new(&*configfile.scanner.interface_name).unwrap())?;
 
     let sock = Socket::with_shared(&iface, &umem)?;
     let device = umem.fq_cq(&sock)?;
@@ -108,9 +117,15 @@ async fn main() -> Result<(), Errno> {
 
     let connections = Arc::new(DashMap::with_hasher(FxBuildHasher));
     let connections_purger = connections.clone();
-
+    
+    let client = Client::with_uri_str(configfile.database.url).await.expect("Error connecting to database");
+    let database = client.database(&configfile.database.name);
+    let collection = database.collection(&configfile.database.collection_name);
+    let collection_responder = collection.clone();
+    
     tokio::spawn(async move {
         let mut responder = Responder::new(
+            collection_responder,
             connections,
             seed,
             ring_buf,
@@ -128,8 +143,8 @@ async fn main() -> Result<(), Errno> {
     tokio::spawn(async move {
         let purger = Purger::new(
             connections_purger,
-            Duration::from_secs(60),
-            Duration::from_secs(60),
+            configfile.purger.interval,
+            configfile.purger.timeout
         );
 
         loop {
@@ -141,7 +156,7 @@ async fn main() -> Result<(), Errno> {
     let completed_printer = completed.clone();
 
     tokio::spawn(async move {
-        let mut printer = Printer::new(completed_printer, Duration::from_secs(5));
+        let mut printer = Printer::new(completed_printer, configfile.printer.interval);
 
         loop {
             printer.tick().await;
@@ -156,19 +171,19 @@ async fn main() -> Result<(), Errno> {
         }
     });
 
-    let tx = Arc::new(RwLock::new(WrappedTx(rxtx.map_tx()?)));
     let iface = get_interfaces().into_iter()
-        .find(|i| i.name == "eth0").unwrap();
+        .find(|i| i.name == configfile.scanner.interface_name).unwrap();
     let gateway_mac = iface.gateway.unwrap().mac_addr.octets();
     let iface_mac = iface.mac_addr.unwrap().octets();
     let source_ip = iface.ipv4.first().unwrap().addr;
 
-    let sender_count = 4;
-    let frame_count = 512 / sender_count;
+    let frame_count = umem.len_frames() as usize;
+    let frame_per_sender = frame_count / configfile.sender.threads;
 
-    for n in 0..sender_count {
+    let tx = Arc::new(RwLock::new(rxtx.map_tx()?.into()));
+    for n in 0..configfile.sender.threads {
         let receiver = receiver.clone();
-        let frames = PacketSender::generate_frames(n, frame_count, &umem, &iface_mac, &gateway_mac, source_ip, ping_data);
+        let frames = PacketSender::generate_frames(n, frame_per_sender, &umem, &iface_mac, &gateway_mac, source_ip, ping_data);
         let tx = tx.clone();
 
         tokio::spawn(async move {
@@ -186,10 +201,7 @@ async fn main() -> Result<(), Errno> {
         });
     }
 
-    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let db = PgConnection::establish(&database_url).expect("Error connecting to database");
-
-    let mut scanner = Scanner::new(db, seed, excludefile, sender);
+    let mut scanner = Scanner::new(collection, seed, excludefile, sender);
     loop {
         scanner.tick();
     }
