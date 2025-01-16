@@ -43,10 +43,11 @@ impl<'a> PacketSender<'a> {
     pub async fn send(&self, Packet { ty, ip, port, seq, ack, ping }: Packet) {
         let frames_len = self.frames.len();
         let frame = self.frame.fetch_add(1, Ordering::SeqCst);
-        if frame > frames_len {
+        if frame >= frames_len - 1 {
             self.frame.store(0, Ordering::SeqCst);
         }
         
+        // SAFETY: too lazy to explain
         let (offset, ipv4_packet, tcp_packet) = unsafe { &mut *(self.frames.as_ptr() as *mut Frame).add(frame) };
 
         let tcp_packet_len = if ty == TcpFlags::SYN {
@@ -76,7 +77,7 @@ impl<'a> PacketSender<'a> {
         );
 
         let tx = &mut self.tx.write().await.0;
-        
+
         {
             let mut writer = tx.transmit(1);
             writer.insert_once(XdpDesc {

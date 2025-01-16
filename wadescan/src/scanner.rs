@@ -42,7 +42,7 @@ impl<'a> Scanner<'a> {
     }
 
     #[inline]
-    pub fn tick(&mut self) {
+    pub async fn tick(&mut self) {
         let ranges = ScanRanges::from_except(
             self.mode.ranges(&self.collection),
             &self.excludes,
@@ -54,22 +54,22 @@ impl<'a> Scanner<'a> {
             1_000_000 * 60 /* 1000 KPPS for 60 seconds */
         );
 
-        (0..packet_count).into_par_iter().for_each(|n| {
+        for n in 0..packet_count {
             let shuffled_index = rng.shuffle(n);
             let dest = ranges.index(shuffled_index as usize);
 
             let ip = dest.0;
             let port = dest.1;
 
-            _ = self.sender.send(Packet {
+            self.sender.send(Packet {
                 ty: TcpFlags::SYN,
                 ip,
                 port,
                 seq: checksum::cookie(ip, port, self.seed),
                 ack: 0,
                 ping: false
-            });
-        });
+            }).await;
+        }
 
         self.mode = self.mode_picker.pick();
     }
