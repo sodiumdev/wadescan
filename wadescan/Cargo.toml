@@ -15,6 +15,7 @@ xdpilone = { workspace = true, default-features = true }
 dashmap = { workspace = true, default-features = true }
 default-net = { workspace = true, default-features = true }
 rand = { workspace = true, features = ["default", "serde", "alloc"] }
+rand_distr = "0.5.0-beta.2"
 perfect_rand = { workspace = true, default-features = true }
 tokio = { workspace = true, features = ["full"] }
 rustc-hash = "2.1.0"
