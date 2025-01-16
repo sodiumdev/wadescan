@@ -18,7 +18,7 @@ impl PacketCompleter {
 
     pub fn tick(&mut self) {
         let mut reader = self.device.complete(1);
-        let reader.read().is_some() {
+        if reader.read().is_some() {
             self.completed.fetch_add(1, Ordering::SeqCst);
         }
 
