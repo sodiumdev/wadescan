@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use aya::maps::{MapData, RingBuf};
 use dashmap::DashMap;
-use flume::Sender;
 use log::debug;
 use mongodb::bson::Document;
 use mongodb::Collection;
@@ -14,6 +13,7 @@ use tokio::io::unix::AsyncFd;
 use wadescan_common::{PacketHeader, PacketType};
 use crate::{checksum, ping, Packet};
 use crate::ping::{RawLatest, Response};
+use crate::sender::PacketSender;
 
 pub struct ConnectionState {
     data: Vec<u8>,
@@ -27,11 +27,11 @@ pub struct ConnectionState {
 
 pub type ConnectionMap = Arc<DashMap<(Ipv4Addr, u16), ConnectionState, FxBuildHasher>>;
 
-pub struct Responder {
+pub struct Responder<'a> {
     collection: Collection<Document>,
 
     connections: ConnectionMap,
-    sender: Sender<Packet>,
+    sender: Arc<PacketSender<'a>>,
     
     fd: AsyncFd<RingBuf<MapData>>,
     seed: u64,
@@ -39,13 +39,14 @@ pub struct Responder {
     ping_data: &'static [u8],
 }
 
-impl Responder {
+impl<'a> Responder<'a> {
     #[inline]
-    pub fn new(collection: Collection<Document>, connections: ConnectionMap, seed: u64, ring_buf: RingBuf<MapData>, sender: Sender<Packet>, ping_data: &'static [u8]) -> Option<Self> {
+    pub fn new(collection: Collection<Document>, connections: ConnectionMap, seed: u64, ring_buf: RingBuf<MapData>, sender: Arc<PacketSender<'a>>, ping_data: &'static [u8]) -> Option<Self> {
         let fd = AsyncFd::new(ring_buf).ok()?;
 
         Some(Self {
             collection,
+            
             connections,
             sender,
             
@@ -79,7 +80,7 @@ impl Responder {
                         continue
                     }
 
-                    _ = self.sender.send_async(Packet {
+                    self.sender.send(Packet {
                         ty: TcpFlags::ACK,
                         ip,
                         port,
@@ -88,7 +89,7 @@ impl Responder {
                         ping: false
                     }).await;
 
-                    _ = self.sender.send_async(Packet {
+                    self.sender.send(Packet {
                         ty: TcpFlags::PSH | TcpFlags::ACK,
                         ip,
                         port,
@@ -113,7 +114,7 @@ impl Responder {
                         if seq != conn.remote_seq {
                             debug!("got wrong seq number! this is probably because of a retransmission");
 
-                            _ = self.sender.send_async(Packet {
+                            self.sender.send(Packet {
                                 ty: TcpFlags::ACK,
                                 ip,
                                 port,
@@ -150,7 +151,7 @@ impl Responder {
                         ping::parse_response(data)
                     };
 
-                    _ = self.sender.send_async(Packet {
+                    self.sender.send(Packet {
                         ty: TcpFlags::ACK,
                         ip,
                         port,
@@ -168,7 +169,7 @@ impl Responder {
                             }
                         }
 
-                        _ = self.sender.send_async(Packet {
+                        self.sender.send(Packet {
                             ty: TcpFlags::FIN | TcpFlags::ACK,
                             ip,
                             port,
@@ -181,7 +182,7 @@ impl Responder {
 
                 PacketType::Fin => {
                     if let Some(mut conn) = self.connections.get_mut(&(ip, port)) {
-                        _ = self.sender.send_async(Packet {
+                        self.sender.send(Packet {
                             ty: TcpFlags::ACK,
                             ip,
                             port,
@@ -191,7 +192,7 @@ impl Responder {
                         }).await;
 
                         if !conn.fin_sent {
-                            _ = self.sender.send_async(Packet {
+                            self.sender.send(Packet {
                                 ty: TcpFlags::FIN | TcpFlags::ACK,
                                 ip,
                                 port,
@@ -208,7 +209,7 @@ impl Responder {
                         }
                     }
 
-                    _ = self.sender.send_async(Packet {
+                    self.sender.send(Packet {
                         ty: TcpFlags::ACK,
                         ip,
                         port,

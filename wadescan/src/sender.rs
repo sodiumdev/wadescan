@@ -1,114 +1,53 @@
-use std::net::Ipv4Addr;
-use std::sync::Arc;
-use flume::Receiver;
-use pnet_base::MacAddr;
-use pnet_packet::ethernet::{EtherTypes, MutableEthernetPacket};
-use pnet_packet::ip::IpNextHeaderProtocols;
-use pnet_packet::ipv4::MutableIpv4Packet;
-use pnet_packet::Packet as _Packet;
-use pnet_packet::tcp::{MutableTcpPacket, TcpFlags, TcpOption};
-use tokio::sync::RwLock;
-use xdpilone::{BufIdx, RingTx, Umem};
-use xdpilone::xdp::XdpDesc;
 use crate::{checksum, Packet};
+use pnet_packet::ipv4::MutableIpv4Packet;
+use pnet_packet::tcp::{MutableTcpPacket, TcpFlags, TcpOption};
+use pnet_packet::Packet as _Packet;
+use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::RwLock;
+use xdpilone::xdp::XdpDesc;
+use xdpilone::RingTx;
 
 type Frame<'a> = (u64, MutableIpv4Packet<'a>, MutableTcpPacket<'a>);
 
-pub struct WrappedTx(pub RingTx);
+struct WrappedTx(RingTx);
 
 unsafe impl Send for WrappedTx {}
 unsafe impl Sync for WrappedTx {}
 
-impl From<RingTx> for WrappedTx {
-    fn from(value: RingTx) -> Self {
-        Self(value)
-    }
-}
-
 pub struct PacketSender<'a> {
     frames: Vec<Frame<'a>>,
-    frame: usize,
-    
-    receiver: Receiver<Packet>,
+    frame: AtomicUsize,
     
     source_ip: Ipv4Addr,
-    tx: Arc<RwLock<WrappedTx>>,
+    tx: RwLock<WrappedTx>,
 
     ping_data_len: usize
 }
 
 impl<'a> PacketSender<'a> {
     #[inline]
-    pub fn generate_frames(n: usize, frame_count: usize, umem: &Umem, interface_mac: &[u8; 6], gateway_mac: &[u8; 6], source_ip: Ipv4Addr, ping_data: &'static [u8]) -> Vec<Frame<'a>> {
-        let offset = n * frame_count;
-        (0..frame_count)
-            .map(|i| {
-                let mut frame = umem.frame(BufIdx((offset + i) as u32)).unwrap();
-                let base = unsafe { frame.addr.as_mut() };
-
-                let (ether_base, base) = base.split_at_mut(14);
-                {
-                    let mut ethernet_packet = MutableEthernetPacket::new(ether_base).unwrap();
-                    ethernet_packet.set_destination(MacAddr::new(gateway_mac[0], gateway_mac[1], gateway_mac[2], gateway_mac[3], gateway_mac[4], gateway_mac[5]));
-                    ethernet_packet.set_source(MacAddr::new(interface_mac[0], interface_mac[1], interface_mac[2], interface_mac[3], interface_mac[4], interface_mac[5]));
-                    ethernet_packet.set_ethertype(EtherTypes::Ipv4);
-                }
-
-                let (ipv4_base, base) = base.split_at_mut(20);
-                let mut ipv4_packet = MutableIpv4Packet::new(ipv4_base).unwrap();
-                ipv4_packet.set_version(4);
-                ipv4_packet.set_header_length(5);
-                ipv4_packet.set_dscp(0);
-                ipv4_packet.set_ecn(0);
-                ipv4_packet.set_identification(1);
-                ipv4_packet.set_flags(0b010);
-                ipv4_packet.set_fragment_offset(0);
-                ipv4_packet.set_ttl(64);
-                ipv4_packet.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
-                ipv4_packet.set_source(source_ip);
-                ipv4_packet.set_options(&[]);
-                
-                let mut tcp_packet = MutableTcpPacket::new(base).unwrap();
-                tcp_packet.set_source(61000);
-                tcp_packet.set_reserved(0);
-                tcp_packet.set_window(32768);
-                tcp_packet.set_urgent_ptr(0);
-                tcp_packet.set_payload(ping_data);
-
-                (frame.offset, ipv4_packet, tcp_packet)
-            })
-            .collect::<Vec<_>>()
-    }
-    
-    #[inline]
-    pub fn new(frames: Vec<Frame<'a>>, source_ip: Ipv4Addr, tx: Arc<RwLock<WrappedTx>>, receiver: Receiver<Packet>, ping_data: &'static [u8]) -> Option<Self> {
+    pub fn new(frames: Vec<Frame<'a>>, source_ip: Ipv4Addr, tx: RingTx, ping_data: &'static [u8]) -> Option<Self> {
         Some(Self {
             frames,
-            frame: 0,
-            
-            receiver,
+            frame: AtomicUsize::new(0),
 
             source_ip,
-            tx,
+            tx: RwLock::new(WrappedTx(tx)),
 
             ping_data_len: ping_data.len()
         })
     }
     
     #[inline]
-    pub async fn tick(&mut self) {
-        let packet = self.receiver.recv_async().await;
-        let Ok(Packet { ty, ip, port, seq, ack, ping }) = packet else {
-            return
-        };
-        
+    pub async fn send(&self, Packet { ty, ip, port, seq, ack, ping }: Packet) {
         let frames_len = self.frames.len();
-        let (offset, ipv4_packet, tcp_packet) = self.frames.get_mut(self.frame).unwrap();
-
-        self.frame += 1;
-        if self.frame >= frames_len {
-            self.frame = 0;
+        let frame = self.frame.fetch_add(1, Ordering::SeqCst);
+        if frame > frames_len {
+            self.frame.store(0, Ordering::SeqCst);
         }
+        
+        let (offset, ipv4_packet, tcp_packet) = unsafe { &mut *(self.frames.as_ptr() as *mut Frame).add(frame) };
 
         let tcp_packet_len = if ty == TcpFlags::SYN {
             tcp_packet.set_data_offset(7);
@@ -135,9 +74,9 @@ impl<'a> PacketSender<'a> {
         ipv4_packet.set_checksum(
             checksum::ipv4(ipv4_packet.packet())
         );
-        
-        let tx = &mut self.tx.write().await.0;
 
+        let tx = &mut self.tx.write().await.0;
+        
         {
             let mut writer = tx.transmit(1);
             writer.insert_once(XdpDesc {

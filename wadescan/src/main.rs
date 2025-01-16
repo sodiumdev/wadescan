@@ -30,9 +30,12 @@ use std::num::NonZeroU32;
 use std::ptr::NonNull;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use xdpilone::{Errno, IfInfo, Socket, SocketConfig, Umem, UmemConfig};
-use crate::configfile::Configfile;
+use pnet_base::MacAddr;
+use pnet_packet::ethernet::{EtherTypes, MutableEthernetPacket};
+use pnet_packet::ip::IpNextHeaderProtocols;
+use pnet_packet::ipv4::MutableIpv4Packet;
+use pnet_packet::tcp::MutableTcpPacket;
+use xdpilone::{BufIdx, Errno, IfInfo, Socket, SocketConfig, Umem, UmemConfig};
 
 #[repr(C, packed)]
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
@@ -113,7 +116,59 @@ async fn main() -> Result<(), Errno> {
 
     umem.bind(&rxtx)?;
 
-    let (sender, receiver) = flume::unbounded::<Packet>();
+    let iface = get_interfaces().into_iter()
+        .find(|i| i.name == configfile.scanner.interface_name).unwrap();
+    let source_ip = iface.ipv4.first().unwrap().addr;
+
+    let gateway_mac = iface.gateway.unwrap().mac_addr.octets();
+    let gateway_mac = MacAddr::new(gateway_mac[0], gateway_mac[1], gateway_mac[2], gateway_mac[3], gateway_mac[4], gateway_mac[5]);
+
+    let iface_mac = iface.mac_addr.unwrap().octets();
+    let iface_mac = MacAddr::new(iface_mac[0], iface_mac[1], iface_mac[2], iface_mac[3], iface_mac[4], iface_mac[5]);
+
+    let frame_count = umem.len_frames();
+    let frames = (0..frame_count).map(|n| {
+        let mut frame = umem.frame(BufIdx(n)).unwrap();
+        let base = unsafe { frame.addr.as_mut() };
+
+        let (ether_base, base) = base.split_at_mut(14);
+        {
+            let mut ethernet_packet = MutableEthernetPacket::new(ether_base).unwrap();
+            ethernet_packet.set_destination(gateway_mac);
+            ethernet_packet.set_source(iface_mac);
+            ethernet_packet.set_ethertype(EtherTypes::Ipv4);
+        }
+
+        let (ipv4_base, base) = base.split_at_mut(20);
+        let mut ipv4_packet = MutableIpv4Packet::new(ipv4_base).unwrap();
+        ipv4_packet.set_version(4);
+        ipv4_packet.set_header_length(5);
+        ipv4_packet.set_dscp(0);
+        ipv4_packet.set_ecn(0);
+        ipv4_packet.set_identification(1);
+        ipv4_packet.set_flags(0b010);
+        ipv4_packet.set_fragment_offset(0);
+        ipv4_packet.set_ttl(64);
+        ipv4_packet.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
+        ipv4_packet.set_source(source_ip);
+        ipv4_packet.set_options(&[]);
+
+        let mut tcp_packet = MutableTcpPacket::new(base).unwrap();
+        tcp_packet.set_source(61000);
+        tcp_packet.set_reserved(0);
+        tcp_packet.set_window(32768);
+        tcp_packet.set_urgent_ptr(0);
+        tcp_packet.set_payload(ping_data);
+
+        (frame.offset, ipv4_packet, tcp_packet)
+    }).collect::<Vec<_>>();
+
+    let sender = Arc::new(PacketSender::new(
+        frames,
+        source_ip,
+        rxtx.map_tx()?,
+        ping_data
+    ).expect("Error initiating packet sender"));
     let sender_completer = sender.clone();
 
     let connections = Arc::new(DashMap::with_hasher(FxBuildHasher));
@@ -171,36 +226,6 @@ async fn main() -> Result<(), Errno> {
             completer.tick();
         }
     });
-
-    let iface = get_interfaces().into_iter()
-        .find(|i| i.name == configfile.scanner.interface_name).unwrap();
-    let gateway_mac = iface.gateway.unwrap().mac_addr.octets();
-    let iface_mac = iface.mac_addr.unwrap().octets();
-    let source_ip = iface.ipv4.first().unwrap().addr;
-
-    let frame_count = umem.len_frames() as usize;
-    let frame_per_sender = frame_count / configfile.sender.threads;
-
-    let tx = Arc::new(RwLock::new(rxtx.map_tx()?.into()));
-    for n in 0..configfile.sender.threads {
-        let receiver = receiver.clone();
-        let frames = PacketSender::generate_frames(n, frame_per_sender, &umem, &iface_mac, &gateway_mac, source_ip, ping_data);
-        let tx = tx.clone();
-
-        tokio::spawn(async move {
-            let mut sender = PacketSender::new(
-                frames,
-                source_ip,
-                tx,
-                receiver,
-                ping_data
-            ).expect("Error initiating packet sender");
-
-            loop {
-                sender.tick().await;
-            }
-        });
-    }
 
     let mut scanner = Scanner::new(collection, seed, excludefile, sender);
     loop {

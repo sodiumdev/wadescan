@@ -44,7 +44,6 @@ pub struct PrinterConfig {
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct SenderConfig {
-    pub threads: usize
 }
 
 pub fn parse_file(input: &str) -> Option<Configfile> {

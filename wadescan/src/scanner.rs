@@ -1,4 +1,4 @@
-use flume::Sender;
+use std::sync::Arc;
 use mongodb::bson::Document;
 use mongodb::Collection;
 use rayon::iter::ParallelIterator;
@@ -8,22 +8,23 @@ use rayon::iter::IntoParallelIterator;
 use crate::mode::{ModePicker, ScanMode};
 use crate::{checksum, Packet};
 use crate::range::{Ipv4Ranges, ScanRanges};
+use crate::sender::PacketSender;
 
-pub struct Scanner {
+pub struct Scanner<'a> {
     seed: u64,
     excludes: Ipv4Ranges,
 
     mode_picker: ModePicker,
     mode: ScanMode,
 
-    sender: Sender<Packet>,
+    sender: Arc<PacketSender<'a>>,
 
     collection: Collection<Document>
 }
 
-impl Scanner {
+impl<'a> Scanner<'a> {
     #[inline]
-    pub fn new(collection: Collection<Document>, seed: u64, excludes: Ipv4Ranges, sender: Sender<Packet>) -> Self {
+    pub fn new(collection: Collection<Document>, seed: u64, excludes: Ipv4Ranges, sender: Arc<PacketSender<'a>>) -> Self {
         let mode_picker = ModePicker::default();
         let mode = mode_picker.pick();
 
