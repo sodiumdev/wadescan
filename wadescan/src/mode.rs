@@ -4,7 +4,7 @@ use std::net::Ipv4Addr;
 use std::str::FromStr;
 use mongodb::bson::Document;
 use mongodb::Collection;
-use rand::distr::{Distribution, WeightedIndex};
+use rand::distributions::{Distribution, WeightedIndex};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap};
 use serde::{Deserialize, Serialize};
@@ -123,7 +123,7 @@ impl ModePicker {
                 .collect::<Vec<_>>(),
         ).unwrap();
 
-        *modes[dist.sample(&mut rand::rng())].0
+        *modes[dist.sample(&mut rand::thread_rng())].0
     }
 
     #[inline]
