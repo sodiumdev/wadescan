@@ -229,6 +229,6 @@ async fn main() -> Result<(), Errno> {
 
     let mut scanner = Scanner::new(collection, seed, excludefile, sender);
     loop {
-        scanner.tick();
+        scanner.tick().await;
     }
 }
