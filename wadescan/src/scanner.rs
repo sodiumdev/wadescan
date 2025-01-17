@@ -1,14 +1,11 @@
-use std::sync::Arc;
-use mongodb::bson::Document;
-use mongodb::Collection;
-use rayon::iter::ParallelIterator;
-use perfect_rand::PerfectRng;
-use pnet_packet::tcp::TcpFlags;
-use rayon::iter::IntoParallelIterator;
 use crate::mode::{ModePicker, ScanMode};
-use crate::{checksum, Packet};
 use crate::range::{Ipv4Ranges, ScanRanges};
 use crate::sender::PacketSender;
+use crate::{checksum, Packet};
+use mongodb::bson::Document;
+use mongodb::Collection;
+use perfect_rand::PerfectRng;
+use pnet_packet::tcp::TcpFlags;
 
 pub struct Scanner<'a> {
     seed: u64,
@@ -42,7 +39,7 @@ impl<'a> Scanner<'a> {
     }
 
     #[inline]
-    pub async fn tick(&mut self) {
+    pub fn tick(&mut self) {
         let ranges = ScanRanges::from_except(
             self.mode.ranges(&self.collection),
             &self.excludes,
@@ -68,7 +65,7 @@ impl<'a> Scanner<'a> {
                 seq: checksum::cookie(ip, port, self.seed),
                 ack: 0,
                 ping: false
-            }).await;
+            });
         }
 
         self.mode = self.mode_picker.pick();

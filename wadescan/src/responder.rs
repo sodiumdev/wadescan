@@ -87,7 +87,7 @@ impl<'a> Responder<'a> {
                         seq: ack,
                         ack: seq + 1,
                         ping: false
-                    }).await;
+                    });
 
                     self.sender.send(Packet {
                         ty: TcpFlags::PSH | TcpFlags::ACK,
@@ -96,7 +96,7 @@ impl<'a> Responder<'a> {
                         seq: ack,
                         ack: seq + 1,
                         ping: true
-                    }).await;
+                    });
                 }
 
                 PacketType::Ack => {
@@ -121,7 +121,7 @@ impl<'a> Responder<'a> {
                                 seq: ack,
                                 ack: conn.remote_seq,
                                 ping: false
-                            }).await;
+                            });
 
                             continue
                         }
@@ -158,7 +158,7 @@ impl<'a> Responder<'a> {
                         seq: ack,
                         ack: remote_seq,
                         ping: false
-                    }).await;
+                    });
 
                     if let Ok(data) = ping_response {
                         if let Ok(mut response) = serde_json::from_slice::<RawLatest>(&data) {
@@ -176,7 +176,7 @@ impl<'a> Responder<'a> {
                             seq: ack,
                             ack: remote_seq,
                             ping: false
-                        }).await;
+                        });
                     }
                 }
 
@@ -189,7 +189,7 @@ impl<'a> Responder<'a> {
                             seq: conn.local_seq,
                             ack: seq + 1,
                             ping: false
-                        }).await;
+                        });
 
                         if !conn.fin_sent {
                             self.sender.send(Packet {
@@ -199,7 +199,7 @@ impl<'a> Responder<'a> {
                                 seq: conn.local_seq,
                                 ack: seq + 1,
                                 ping: false
-                            }).await;
+                            });
 
                             conn.fin_sent = true;
                         }
@@ -216,7 +216,7 @@ impl<'a> Responder<'a> {
                         seq: ack,
                         ack: seq + 1,
                         ping: false
-                    }).await;
+                    });
                 }
                 
                 _ => unreachable!()

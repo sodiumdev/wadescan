@@ -40,7 +40,7 @@ impl<'a> PacketSender<'a> {
     }
     
     #[inline]
-    pub async fn send(&mut self, Packet { ty, ip, port, seq, ack, ping }: Packet) {
+    pub fn send(&mut self, Packet { ty, ip, port, seq, ack, ping }: Packet) {
         self.frame += 1;
         if self.frame >= self.frames.len() {
             self.frame = 0;

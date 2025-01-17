@@ -13,10 +13,10 @@ use network_types::tcp::TcpHdr;
 use wadescan_common::{PacketHeader, PacketType};
 
 const LEN_SIZE: usize = size_of::<u16>();
-const MAX_SIZE: usize = u16::MAX as usize;
+const MSS: usize = 1340;
 
 #[map]
-static RING_BUF: RingBuf = RingBuf::with_byte_size((128 * (PacketHeader::LEN + LEN_SIZE + MAX_SIZE + 8)) as u32, 0);
+static RING_BUF: RingBuf = RingBuf::with_byte_size((128 * (PacketHeader::LEN + LEN_SIZE + MSS + 8)) as u32, 0);
 
 const PORT: u16 = 61000u16.to_be();
 
@@ -102,7 +102,7 @@ const unsafe fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, (
 
 #[inline(always)]
 fn output(ctx: &XdpContext, packet: PacketHeader, offset: usize, len: usize) -> Result<u32, ()> {
-    match RING_BUF.reserve::<[u8; PacketHeader::LEN + LEN_SIZE + MAX_SIZE]>(0) {
+    match RING_BUF.reserve::<[u8; PacketHeader::LEN + LEN_SIZE + MSS]>(0) {
         Some(mut event) => {
             unsafe {
                 ptr::write_unaligned(event.as_mut_ptr() as *mut _, packet);
@@ -115,7 +115,7 @@ fn output(ctx: &XdpContext, packet: PacketHeader, offset: usize, len: usize) -> 
                 return Ok(XDP_PASS);
             }
 
-            if !aya_ebpf::check_bounds_signed(len as i64, 1, MAX_SIZE as i64) {
+            if !aya_ebpf::check_bounds_signed(len as i64, 1, MSS as i64) {
                 event.discard(0);
 
                 return Err(())

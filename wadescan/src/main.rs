@@ -30,6 +30,7 @@ use std::num::NonZeroU32;
 use std::ptr::NonNull;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use anyhow::Context;
 use pnet_base::MacAddr;
 use pnet_packet::ethernet::{EtherTypes, MutableEthernetPacket};
 use pnet_packet::ip::IpNextHeaderProtocols;
@@ -72,12 +73,27 @@ async fn main() -> Result<(), Errno> {
 
     _ = aya_log::EbpfLogger::init(&mut ebpf);
 
-    let excludefile = excludefile::parse_file("exclude.conf").expect("Error parsing excludefile");
-    let configfile = configfile::parse_file("config.toml").expect("Error parsing configfile");
+    let excludefile = excludefile::parse_file("exclude.conf")
+        .context("parsing excludefile").unwrap();
+    let configfile = configfile::parse_file("config.toml")
+        .context("parsing configfile").unwrap();
 
-    let program: &mut Xdp = ebpf.program_mut("wadescan").unwrap().try_into().unwrap();
-    program.load().unwrap();
-    program.attach(&configfile.scanner.interface_name, XdpFlags::SKB_MODE).unwrap();
+    let program: &mut Xdp = ebpf.program_mut("wadescan")
+        .unwrap()
+        .try_into()
+        .unwrap();
+    
+    program.load()
+        .context("loading program")
+        .unwrap();
+    
+    program.attach(&configfile.scanner.interface_name, XdpFlags::default())
+        .context("attaching program")
+        .or_else(|_| 
+            program.attach(&configfile.scanner.interface_name, XdpFlags::SKB_MODE)
+                .context("attaching program via skb")
+        )
+        .unwrap();
 
     let ping_config = configfile.ping;
     let ping_data: &[u8] = ping::build_latest_request(
@@ -275,6 +291,6 @@ async fn main() -> Result<(), Errno> {
     );
     
     loop {
-        scanner.tick().await;
+        scanner.tick();
     }
 }
