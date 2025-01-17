@@ -1,7 +1,7 @@
 [database]
-url = "ur mongodb url here"
-name = "name of le database"
-collection_name = "name of le collection"
+url = "mongodb://myUserAdmin:Enes1128%23@78.189.59.154:27017"
+name = "r"
+collection_name = "r"
 
 [ping]
 address = "wadescan"
@@ -20,8 +20,7 @@ secs = 60
 nanos = 0
 
 [printer.interval]
-secs = 60
+secs = 5
 nanos = 0
 
 [sender]
-threads = 4

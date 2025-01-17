@@ -3,24 +3,24 @@ use pnet_packet::ipv4::MutableIpv4Packet;
 use pnet_packet::tcp::{MutableTcpPacket, TcpFlags, TcpOption};
 use pnet_packet::Packet as _Packet;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use tokio::sync::RwLock;
 use xdpilone::xdp::XdpDesc;
 use xdpilone::RingTx;
 
 type Frame<'a> = (u64, MutableIpv4Packet<'a>, MutableTcpPacket<'a>);
 
-struct WrappedTx(RingTx);
+struct Tx(RingTx);
 
-unsafe impl Send for WrappedTx {}
-unsafe impl Sync for WrappedTx {}
+unsafe impl Send for Tx {}
+unsafe impl Sync for Tx {}
 
 pub struct PacketSender<'a> {
     frames: Vec<Frame<'a>>,
-    frame: AtomicUsize,
+    frame: usize,
     
     source_ip: Ipv4Addr,
-    tx: RwLock<WrappedTx>,
+    tx: Tx,
 
     ping_data_len: usize
 }
@@ -30,25 +30,24 @@ impl<'a> PacketSender<'a> {
     pub fn new(frames: Vec<Frame<'a>>, source_ip: Ipv4Addr, tx: RingTx, ping_data: &'static [u8]) -> Option<Self> {
         Some(Self {
             frames,
-            frame: AtomicUsize::new(0),
+            frame: 0,
 
             source_ip,
-            tx: RwLock::new(WrappedTx(tx)),
+            tx: Tx(tx),
 
             ping_data_len: ping_data.len()
         })
     }
     
     #[inline]
-    pub async fn send(&self, Packet { ty, ip, port, seq, ack, ping }: Packet) {
-        let frames_len = self.frames.len();
-        let frame = self.frame.fetch_add(1, Ordering::SeqCst);
-        if frame >= frames_len - 1 {
-            self.frame.store(0, Ordering::SeqCst);
+    pub async fn send(&mut self, Packet { ty, ip, port, seq, ack, ping }: Packet) {
+        self.frame += 1;
+        if self.frame >= self.frames.len() {
+            self.frame = 0;
         }
-        
-        // SAFETY: too lazy to explain
-        let (offset, ipv4_packet, tcp_packet) = unsafe { &mut *(self.frames.as_ptr() as *mut Frame).add(frame) };
+
+        // SAFETY: bound checks are done above
+        let (offset, ipv4_packet, tcp_packet) = unsafe { &mut *self.frames.as_mut_ptr().add(self.frame) };
 
         let tcp_packet_len = if ty == TcpFlags::SYN {
             tcp_packet.set_data_offset(7);
@@ -75,11 +74,9 @@ impl<'a> PacketSender<'a> {
         ipv4_packet.set_checksum(
             checksum::ipv4(ipv4_packet.packet())
         );
-
-        let tx = &mut self.tx.write().await.0;
-
+        
         {
-            let mut writer = tx.transmit(1);
+            let mut writer = self.tx.0.transmit(1);
             writer.insert_once(XdpDesc {
                 addr: *offset,
                 len: (34 + tcp_packet_len) as u32,
@@ -89,8 +86,8 @@ impl<'a> PacketSender<'a> {
             writer.commit();
         }
 
-        if tx.needs_wakeup() {
-            tx.wake();
+        if self.tx.0.needs_wakeup() {
+            self.tx.0.wake();
         }
     }
 }

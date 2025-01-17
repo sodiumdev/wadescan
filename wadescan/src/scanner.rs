@@ -17,14 +17,14 @@ pub struct Scanner<'a> {
     mode_picker: ModePicker,
     mode: ScanMode,
 
-    sender: Arc<PacketSender<'a>>,
+    sender: PacketSender<'a>,
 
     collection: Collection<Document>
 }
 
 impl<'a> Scanner<'a> {
     #[inline]
-    pub fn new(collection: Collection<Document>, seed: u64, excludes: Ipv4Ranges, sender: Arc<PacketSender<'a>>) -> Self {
+    pub fn new(collection: Collection<Document>, seed: u64, excludes: Ipv4Ranges, sender: PacketSender<'a>) -> Self {
         let mode_picker = ModePicker::default();
         let mode = mode_picker.pick();
 

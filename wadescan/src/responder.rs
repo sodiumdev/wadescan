@@ -31,7 +31,7 @@ pub struct Responder<'a> {
     collection: Collection<Document>,
 
     connections: ConnectionMap,
-    sender: Arc<PacketSender<'a>>,
+    sender: PacketSender<'a>,
     
     fd: AsyncFd<RingBuf<MapData>>,
     seed: u64,
@@ -41,7 +41,7 @@ pub struct Responder<'a> {
 
 impl<'a> Responder<'a> {
     #[inline]
-    pub fn new(collection: Collection<Document>, connections: ConnectionMap, seed: u64, ring_buf: RingBuf<MapData>, sender: Arc<PacketSender<'a>>, ping_data: &'static [u8]) -> Option<Self> {
+    pub fn new(collection: Collection<Document>, connections: ConnectionMap, seed: u64, ring_buf: RingBuf<MapData>, sender: PacketSender<'a>, ping_data: &'static [u8]) -> Option<Self> {
         let fd = AsyncFd::new(ring_buf).ok()?;
 
         Some(Self {

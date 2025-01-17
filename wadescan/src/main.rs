@@ -163,14 +163,6 @@ async fn main() -> Result<(), Errno> {
         (frame.offset, ipv4_packet, tcp_packet)
     }).collect::<Vec<_>>();
 
-    let sender = Arc::new(PacketSender::new(
-        frames,
-        source_ip,
-        rxtx.map_tx()?,
-        ping_data
-    ).expect("Error initiating packet sender"));
-    let sender_completer = sender.clone();
-
     let connections = Arc::new(DashMap::with_hasher(FxBuildHasher));
     let connections_purger = connections.clone();
     
@@ -179,13 +171,19 @@ async fn main() -> Result<(), Errno> {
     let collection = database.collection(&configfile.database.collection_name);
     let collection_responder = collection.clone();
     
+    let tx = rxtx.map_tx()?;
     tokio::spawn(async move {
         let mut responder = Responder::new(
             collection_responder,
             connections,
             seed,
             ring_buf,
-            sender_completer,
+            PacketSender::new(
+                frames,
+                source_ip,
+                tx,
+                ping_data
+            ).expect("Error initiating packet sender"),
             ping_data
         ).expect("Error initiating responder");
 
@@ -227,7 +225,55 @@ async fn main() -> Result<(), Errno> {
         }
     });
 
-    let mut scanner = Scanner::new(collection, seed, excludefile, sender);
+    let frames = (0..frame_count).map(|n| {
+        let mut frame = umem.frame(BufIdx(n)).unwrap();
+        let base = unsafe { frame.addr.as_mut() };
+
+        let (ether_base, base) = base.split_at_mut(14);
+        {
+            let mut ethernet_packet = MutableEthernetPacket::new(ether_base).unwrap();
+            ethernet_packet.set_destination(gateway_mac);
+            ethernet_packet.set_source(iface_mac);
+            ethernet_packet.set_ethertype(EtherTypes::Ipv4);
+        }
+
+        let (ipv4_base, base) = base.split_at_mut(20);
+        let mut ipv4_packet = MutableIpv4Packet::new(ipv4_base).unwrap();
+        ipv4_packet.set_version(4);
+        ipv4_packet.set_header_length(5);
+        ipv4_packet.set_dscp(0);
+        ipv4_packet.set_ecn(0);
+        ipv4_packet.set_identification(1);
+        ipv4_packet.set_flags(0b010);
+        ipv4_packet.set_fragment_offset(0);
+        ipv4_packet.set_ttl(64);
+        ipv4_packet.set_next_level_protocol(IpNextHeaderProtocols::Tcp);
+        ipv4_packet.set_source(source_ip);
+        ipv4_packet.set_options(&[]);
+
+        let mut tcp_packet = MutableTcpPacket::new(base).unwrap();
+        tcp_packet.set_source(61000);
+        tcp_packet.set_reserved(0);
+        tcp_packet.set_window(32768);
+        tcp_packet.set_urgent_ptr(0);
+        tcp_packet.set_payload(ping_data);
+
+        (frame.offset, ipv4_packet, tcp_packet)
+    }).collect::<Vec<_>>();
+    
+    let tx = rxtx.map_tx()?;
+    let mut scanner = Scanner::new(
+        collection, 
+        seed, 
+        excludefile,
+        PacketSender::new(
+            frames,
+            source_ip,
+            tx,
+            ping_data
+        ).expect("Error initiating packet sender"),
+    );
+    
     loop {
         scanner.tick().await;
     }
