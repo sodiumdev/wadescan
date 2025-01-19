@@ -75,7 +75,7 @@ pub struct ScanRanges {
 
 impl ScanRanges {
     #[inline]
-    pub fn from_except(ranges: Vec<ScanRange>, excludes: &Ipv4Ranges) -> Self {
+    pub fn from_excluding(ranges: Vec<ScanRange>, excludes: &Ipv4Ranges) -> Self {
         let mut this = Self { ranges };
         this.apply_exclude(excludes);
         this
@@ -222,7 +222,7 @@ pub struct StaticScanRange {
 }
 
 impl StaticScanRanges {
-    #[inline(always)]
+    #[inline]
     pub const fn index(&self, index: usize) -> (Ipv4Addr, u16) {
         let mut start = 0;
         let mut end = self.ranges.len();
