@@ -16,9 +16,9 @@ const LEN_SIZE: usize = size_of::<u16>();
 const MSS: usize = 1340;
 
 #[map]
-static RING_BUF: RingBuf = RingBuf::with_byte_size((128 * (PacketHeader::LEN + LEN_SIZE + MSS + 8)) as u32, 0);
+static RING_BUF: RingBuf = RingBuf::with_byte_size((4096 * (PacketHeader::LEN + LEN_SIZE + MSS + 8)) as u32, 0);
 
-const PORT: u16 = 61000u16.to_be();
+const PORT: u16 = 43169u16.to_be();
 
 #[xdp]
 pub fn wadescan(ctx: XdpContext) -> u32 {
@@ -59,7 +59,7 @@ fn try_receive(ctx: XdpContext) -> Result<u32, ()> {
     let (seq, ack) = unsafe {
         (u32::from_be((*tcp_hdr).seq), u32::from_be((*tcp_hdr).ack_seq))
     };
-    
+
     output(
         &ctx,
         PacketHeader {

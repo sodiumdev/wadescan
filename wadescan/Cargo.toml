@@ -19,9 +19,6 @@ perfect_rand = { workspace = true, default-features = true }
 tokio = { workspace = true, features = ["full"] }
 rustc-hash = "2.1.0"
 log = "0.4.22"
-pnet_packet = "0.35.0"
-pnet_base = "0.35.0"
-flume = "0.11.1"
 rayon = "1.10.0"
 serde = "1.0.217"
 toml = "0.8.19"

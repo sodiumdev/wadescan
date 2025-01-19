@@ -19,7 +19,7 @@ impl PacketCompleter {
     pub fn tick(&mut self) {
         let mut reader = self.device.complete(1);
         if reader.read().is_some() {
-            self.completed.fetch_add(1, Ordering::SeqCst);
+            self.completed.fetch_add(1, Ordering::Relaxed);
         }
 
         reader.release();
@@ -48,7 +48,7 @@ impl Printer {
 
     #[inline]
     pub async fn tick(&mut self) {
-        let completed = self.completed.load(Ordering::SeqCst);
+        let completed = self.completed.load(Ordering::Acquire);
         let packets_per_second = (completed - self.completed_last) as f64 / self.last_print_time.elapsed().as_secs_f64();
         if packets_per_second > 10_000_000. {
             println!("{} mpps", (packets_per_second / 1_000_000.).round() as u64)

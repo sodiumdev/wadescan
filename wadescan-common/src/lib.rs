@@ -18,7 +18,7 @@ pub struct PacketHeader {
     pub ip: u32,
     pub port: u16,
     pub seq: u32,
-    pub ack: u32
+    pub ack: u32,
 }
 
 impl PacketHeader {

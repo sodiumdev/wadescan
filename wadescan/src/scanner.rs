@@ -1,11 +1,11 @@
 use crate::mode::{ModePicker, ScanMode};
 use crate::range::{Ipv4Ranges, ScanRanges};
 use crate::sender::PacketSender;
-use crate::{checksum, Packet};
 use mongodb::bson::Document;
 use mongodb::Collection;
 use perfect_rand::PerfectRng;
-use pnet_packet::tcp::TcpFlags;
+use xdpilone::xdp::XdpDesc;
+use crate::checksum;
 
 pub struct Scanner<'a> {
     seed: u64,
@@ -40,32 +40,21 @@ impl<'a> Scanner<'a> {
 
     #[inline]
     pub fn tick(&mut self) {
-        let ranges = ScanRanges::from_except(
+        let ranges = ScanRanges::from_excluding(
             self.mode.ranges(&self.collection),
             &self.excludes,
         ).into_static();
 
         let rng = PerfectRng::new(ranges.count as u64, self.seed, 3);
-        let packet_count = u64::min(
-            ranges.count as u64,
-            1_000_000 * 60 /* 1000 KPPS for 60 seconds */
-        );
+        for n in 0..ranges.count {
+            let index = rng.shuffle(n as u64) as usize;
+            let (ip, port) = ranges.index(index);
 
-        for n in 0..packet_count {
-            let shuffled_index = rng.shuffle(n);
-            let dest = ranges.index(shuffled_index as usize);
-
-            let ip = dest.0;
-            let port = dest.1;
-
-            self.sender.send(Packet {
-                ty: TcpFlags::SYN,
-                ip,
+            self.sender.send_syn(
+                &ip,
                 port,
-                seq: checksum::cookie(ip, port, self.seed),
-                ack: 0,
-                ping: false
-            });
+                self.seed
+            );
         }
 
         self.mode = self.mode_picker.pick();
