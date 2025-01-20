@@ -1,7 +1,7 @@
 [database]
 url = "mongodb://myUserAdmin:Enes1128%23@78.189.59.154:27017"
-name = "r"
-collection_name = "r"
+name = "diddy"
+collection_name = "party"
 
 [ping]
 address = "wadescan"
