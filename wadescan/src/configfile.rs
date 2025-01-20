@@ -29,7 +29,6 @@ pub struct PingConfig {
 #[derive(Default, Serialize, Deserialize)]
 pub struct ScannerConfig {
     pub interface_name: String,
-    pub tick_interval: Duration,
 }
 
 #[derive(Default, Serialize, Deserialize)]

@@ -68,6 +68,7 @@ async fn main() -> Result<(), Errno> {
     let excludefile = excludefile::parse_file("exclude.conf").expect("failed to parse excludefile");
 
     let configfile = configfile::parse_file("config.toml").expect("failed to parse configfile");
+    return Ok(());
 
     let program: &mut Xdp = ebpf
         .program_mut("wadescan")
