@@ -82,14 +82,14 @@ impl<'a> Responder<'a> {
 
             match unsafe { (*hdr).ty } {
                 PacketType::SynAck => {
-                    if ack != checksum::cookie(&ip, port, self.seed) + 1 {
-                        debug!("invalid cookie at SYN+ACK");
+                    let expected = checksum::cookie(&ip, port, self.seed) + 1;
+                    if ack != expected {
+                        debug!("cookie mismatch for {ip}:{port} at SYN+ACK (expected {expected}, got {ack})");
 
                         continue;
                     }
 
                     self.sender.send_ack(&ip, port, ack, seq + 1);
-
                     self.sender.send_psh(&ip, port, ack, seq + 1);
                 }
 
@@ -98,12 +98,12 @@ impl<'a> Responder<'a> {
 
                     let len = unsafe { ptr::read_unaligned(read.cast::<u16>()) };
                     if len == 0 {
-                        debug!("received ACK without data from {}:{}", ip, port);
+                        debug!("received ACK without data from {ip}:{port}");
 
                         continue;
                     }
 
-                    debug!("received ACK with {} bytes from {}:{}", len, ip, port);
+                    debug!("received ACK with {len} bytes from {ip}:{port}");
 
                     let data = unsafe { from_raw_parts(read.add(size_of::<u16>()), len as usize) };
 
@@ -124,11 +124,10 @@ impl<'a> Responder<'a> {
 
                         ping::parse_response(&conn.data)
                     } else {
-                        if ack
-                            != checksum::cookie(&ip, port, self.seed)
-                                .wrapping_add((self.ping_data.len() + 1) as u32)
-                        {
-                            debug!("cookie mismatch when reading data from: {}", ip);
+                        let expected = checksum::cookie(&ip, port, self.seed)
+                            .wrapping_add((self.ping_data.len() + 1) as u32);
+                        if ack != expected {
+                            debug!("cookie mismatch for {ip}:{port} at ACK (expected {expected}, got {ack})");
 
                             continue;
                         }
@@ -160,7 +159,6 @@ impl<'a> Responder<'a> {
                             println!("{}", String::from_utf8_lossy(&data));
 
                             self.sender.send_ack(&ip, port, ack, remote_seq);
-
                             self.sender.send_fin(&ip, port, ack, remote_seq);
                         }
 
