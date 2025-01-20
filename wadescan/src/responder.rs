@@ -8,7 +8,7 @@ use std::{
 
 use aya::maps::{MapData, RingBuf};
 use dashmap::DashMap;
-use log::debug;
+use log::{debug, trace};
 use mongodb::{bson::Document, Collection};
 use rustc_hash::FxBuildHasher;
 use tokio::io::unix::AsyncFd;
@@ -75,12 +75,14 @@ impl<'a> Responder<'a> {
             let hdr: *const PacketHeader = read as *const PacketHeader;
 
             let ip = Ipv4Addr::from(unsafe { (*hdr).ip });
-
+            let ty = unsafe { (*hdr).ty };
             let port = unsafe { (*hdr).port };
             let seq = unsafe { (*hdr).seq };
             let ack = unsafe { (*hdr).ack };
 
-            match unsafe { (*hdr).ty } {
+            trace!("received {ty:?} packet from {ip}:{port} with seq:{seq}/ack:{ack}");
+
+            match ty {
                 PacketType::SynAck => {
                     let expected = checksum::cookie(&ip, port, self.seed) + 1;
                     if ack != expected {
@@ -170,6 +172,8 @@ impl<'a> Responder<'a> {
                 }
 
                 PacketType::Fin => {
+                    debug!("received FIN");
+
                     if let Some(mut conn) = self.connections.get_mut(&(ip, port)) {
                         self.sender.send_ack(&ip, port, conn.local_seq, seq + 1);
 
