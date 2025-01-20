@@ -424,8 +424,6 @@ impl<'a> PacketSender<'a> {
 
     #[inline]
     pub fn send_fin(&mut self, ip: &Ipv4Addr, port: u16, seq: u32, ack: u32) {
-        return;
-
         self.fin_frame += 1;
         if self.fin_frame >= self.frames.fin_frames.len() {
             self.fin_frame = 0;
