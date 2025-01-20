@@ -11,6 +11,7 @@ pub mod range;
 pub mod responder;
 pub mod scanner;
 pub mod sender;
+mod shared;
 
 use std::{
     alloc::{alloc, Layout},
@@ -34,14 +35,12 @@ use xdpilone::{Errno, IfInfo, Socket, SocketConfig, Umem, UmemConfig};
 
 use crate::{
     completer::{PacketCompleter, Printer},
-    responder::{Purger, Responder},
+    responder::{Purger, Responder, TickResult},
     scanner::Scanner,
     sender::{PacketSender, SenderKind},
 };
 
-const UMEM_SIZE: usize = 1 << 30;
-
-#[tokio::main(flavor = "multi_thread", worker_threads = 20)]
+#[tokio::main(flavor = "multi_thread", worker_threads = 6)]
 async fn main() -> Result<(), Errno> {
     env_logger::init();
 
@@ -66,17 +65,17 @@ async fn main() -> Result<(), Errno> {
 
     _ = aya_log::EbpfLogger::init(&mut ebpf);
 
-    let excludefile = excludefile::parse_file("exclude.conf")
-        .context("parsing excludefile")
-        .unwrap();
-    let configfile = configfile::parse_file("config.toml")
-        .context("parsing configfile")
-        .unwrap();
+    let excludefile = excludefile::parse_file("exclude.conf").expect("failed to parse excludefile");
 
-    let program: &mut Xdp = ebpf.program_mut("wadescan").unwrap().try_into().unwrap();
+    let configfile = configfile::parse_file("config.toml").expect("failed to parse configfile");
 
-    program.load().context("loading program").unwrap();
+    let program: &mut Xdp = ebpf
+        .program_mut("wadescan")
+        .expect("failed to find ebpf program")
+        .try_into()
+        .expect("failed to convert program to xdp");
 
+    program.load().expect("failed to load ebpf program");
     program
         .attach(&configfile.scanner.interface_name, XdpFlags::default())
         .context("attaching program")
@@ -87,25 +86,25 @@ async fn main() -> Result<(), Errno> {
         })
         .unwrap();
 
-    let ping_config = configfile.ping;
     let ping_data: &[u8] = ping::build_latest_request(
-        ping_config.protocol_version,
-        &ping_config.address,
-        ping_config.port,
+        configfile.ping.protocol_version,
+        &configfile.ping.address,
+        configfile.ping.port,
     )
     .leak();
 
     let seed = rand::random();
 
-    let layout = Layout::from_size_align(UMEM_SIZE, 16384).unwrap();
+    let umem_size = 1 << configfile.sender.umem_size;
+    let layout = Layout::from_size_align(umem_size, 16384).unwrap();
     let ptr =
-        NonNull::slice_from_raw_parts(unsafe { NonNull::new_unchecked(alloc(layout)) }, UMEM_SIZE);
+        NonNull::slice_from_raw_parts(unsafe { NonNull::new_unchecked(alloc(layout)) }, umem_size);
 
     let umem = unsafe {
         Umem::new(
             UmemConfig {
-                fill_size: 1,
-                complete_size: 1 << 26,
+                fill_size: 1, // 0 won't work for some reason
+                complete_size: 1 << configfile.sender.complete_size,
                 frame_size: 1 << 12,
                 headroom: 0,
                 flags: 0,
@@ -117,7 +116,10 @@ async fn main() -> Result<(), Errno> {
 
     let mut iface = IfInfo::invalid();
     iface
-        .from_name(&CString::new(&*configfile.scanner.interface_name).unwrap())
+        .from_name(
+            &CString::new(&*configfile.scanner.interface_name)
+                .expect("error converting interface name to a cstr"),
+        )
         .expect("failed to find interface");
 
     let sender_sock =
@@ -126,12 +128,13 @@ async fn main() -> Result<(), Errno> {
         .fq_cq(&sender_sock)
         .expect("failed to create device queue");
 
+    let tx_size = NonZeroU32::new(1 << configfile.sender.tx_size);
     let sender_rxtx = umem
         .rx_tx(
             &sender_sock,
             &SocketConfig {
                 rx_size: None,
-                tx_size: NonZeroU32::new(1 << 26),
+                tx_size,
                 bind_flags: SocketConfig::XDP_BIND_ZEROCOPY | SocketConfig::XDP_BIND_NEED_WAKEUP,
             },
         )
@@ -146,7 +149,7 @@ async fn main() -> Result<(), Errno> {
             &responder_sock,
             &SocketConfig {
                 rx_size: None,
-                tx_size: NonZeroU32::new(1 << 26),
+                tx_size,
                 bind_flags: 0,
             },
         )
@@ -170,7 +173,8 @@ async fn main() -> Result<(), Errno> {
 
     let client = Client::with_uri_str(configfile.database.url)
         .await
-        .expect("Error connecting to database");
+        .expect("failed to initiate database connection");
+
     let database = client.database(&configfile.database.name);
     let collection = database.collection(&configfile.database.collection_name);
     let collection_responder = collection.clone();
@@ -184,6 +188,8 @@ async fn main() -> Result<(), Errno> {
         ping_data,
     );
 
+    let (server_sender, server_receiver) = flume::unbounded();
+
     let tx = responder_rxtx.map_tx()?;
     tokio::spawn(async move {
         let mut responder = Responder::new(
@@ -191,13 +197,14 @@ async fn main() -> Result<(), Errno> {
             connections,
             seed,
             ring_buf,
-            PacketSender::new(tx, frames).expect("Error initiating packet sender"),
+            PacketSender::new(tx, frames).expect("failed to initiate packet sender"),
+            server_sender,
             ping_data,
         )
-        .expect("Error initiating responder");
+        .expect("failed to initiate responder");
 
         loop {
-            if responder.tick().await.is_none() {
+            if let TickResult::Stop = responder.tick().await {
                 break;
             }
         }
@@ -249,10 +256,12 @@ async fn main() -> Result<(), Errno> {
         collection,
         seed,
         excludefile,
-        PacketSender::new(tx, frames).expect("Error initiating packet sender"),
+        PacketSender::new(tx, frames).expect("failed to initiate packet sender"),
+        server_receiver,
+        configfile.purger.timeout,
     );
 
     loop {
-        scanner.tick();
+        scanner.tick().await;
     }
 }

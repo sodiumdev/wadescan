@@ -1,5 +1,4 @@
 use std::{mem, net::Ipv4Addr};
-use rayon::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanRange {
@@ -12,7 +11,7 @@ pub struct ScanRange {
 impl ScanRange {
     #[inline(always)]
     pub const fn count_addresses(&self) -> usize {
-        (self.addr_end.to_bits() as u64 - self.addr_start.to_bits() as u64 + 1) as usize
+        (self.addr_end.to_bits() - self.addr_start.to_bits() + 1) as usize
     }
 
     #[inline(always)]
@@ -76,11 +75,12 @@ pub struct ScanRanges {
 impl ScanRanges {
     #[inline]
     pub fn from_excluding(ranges: Vec<ScanRange>, excludes: &Ipv4Ranges) -> Self {
-        let mut this = Self { ranges };
+        let mut this = Self::default();
+        this.extend(ranges);
         this.apply_exclude(excludes);
         this
     }
-    
+
     #[inline]
     pub fn extend(&mut self, ranges: Vec<ScanRange>) {
         self.ranges.extend(ranges);
@@ -98,7 +98,7 @@ impl ScanRanges {
         let Some(mut scan_range) = scan_ranges.next() else {
             return vec![];
         };
-        
+
         let Some(mut exclude_range) = exclude_ranges.next() else {
             ranges.extend(scan_ranges);
             self.ranges = ranges;
@@ -110,24 +110,26 @@ impl ScanRanges {
                 ranges.push(scan_range);
                 scan_range = match scan_ranges.next() {
                     Some(scan_range) => scan_range,
-                    None => break
+                    None => break,
                 };
             } else if scan_range.addr_start > exclude_range.end {
                 exclude_range = match exclude_ranges.next() {
                     Some(exclude_range) => exclude_range,
                     None => {
                         ranges.push(scan_range);
-                        break
+                        break;
                     }
                 };
-            } else if scan_range.addr_start < exclude_range.start && scan_range.addr_end > exclude_range.end {
+            } else if scan_range.addr_start < exclude_range.start
+                && scan_range.addr_end > exclude_range.end
+            {
                 ranges.push(ScanRange {
                     addr_start: scan_range.addr_start,
                     addr_end: Ipv4Addr::from(u32::from(exclude_range.start) - 1),
                     port_start: scan_range.port_start,
                     port_end: scan_range.port_end,
                 });
-                
+
                 removed_ranges.push(*exclude_range);
                 scan_range.addr_start = Ipv4Addr::from(u32::from(exclude_range.end) + 1);
             } else if scan_range.addr_start < exclude_range.start {
@@ -137,12 +139,12 @@ impl ScanRanges {
                     port_start: scan_range.port_start,
                     port_end: scan_range.port_end,
                 });
-                
+
                 removed_ranges.push(Ipv4Range {
                     start: exclude_range.start,
                     end: scan_range.addr_end,
                 });
-                
+
                 scan_range = match scan_ranges.next() {
                     Some(scan_range) => scan_range,
                     None => break,
@@ -171,25 +173,6 @@ impl ScanRanges {
     }
 
     #[inline]
-    pub fn count(&self) -> usize {
-        let mut total = 0;
-        for range in &self.ranges {
-            total += range.count();
-        }
-        total
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.ranges.is_empty()
-    }
-
-    #[inline]
-    pub fn ranges(&self) -> &Vec<ScanRange> {
-        &self.ranges
-    }
-
-    #[inline]
     pub fn into_static(self) -> StaticScanRanges {
         let mut ranges = Vec::with_capacity(self.ranges.len());
         let mut index = 0;
@@ -202,7 +185,7 @@ impl ScanRanges {
             });
             index += count;
         }
-        
+
         StaticScanRanges {
             ranges,
             count: index,
@@ -223,6 +206,11 @@ pub struct StaticScanRange {
 
 impl StaticScanRanges {
     #[inline]
+    pub fn from_excluding(ranges: Vec<ScanRange>, excludes: &Ipv4Ranges) -> Self {
+        ScanRanges::from_excluding(ranges, excludes).into_static()
+    }
+
+    #[inline]
     pub const fn index(&self, index: usize) -> (Ipv4Addr, u16) {
         let mut start = 0;
         let mut end = self.ranges.len();
@@ -230,10 +218,10 @@ impl StaticScanRanges {
             let mid = (start + end) >> 1;
             let range = unsafe {
                 core::hint::assert_unchecked(mid < self.ranges.len());
-                
+
                 &*(self.ranges.as_ptr().add(mid))
             };
-            
+
             if range.index + range.count <= index {
                 start = mid + 1;
             } else if range.index > index {
@@ -273,36 +261,7 @@ impl Ipv4Ranges {
         Self { ranges }
     }
 
-    pub fn contains(&self, addr: Ipv4Addr) -> bool {
-        let mut start = 0;
-        let mut end = self.ranges.len();
-        while start < end {
-            let mid = (start + end) / 2;
-            let range = &self.ranges[mid];
-            if range.end < addr {
-                start = mid + 1;
-            } else if range.start > addr {
-                end = mid;
-            } else {
-                return true;
-            }
-        }
-        false
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.ranges.is_empty()
-    }
-
-    pub fn ranges(&self) -> &Vec<Ipv4Range> {
+    pub fn ranges(&self) -> &[Ipv4Range] {
         &self.ranges
-    }
-
-    pub fn count(&self) -> usize {
-        let mut total: u64 = 0;
-        for range in &self.ranges {
-            total += (u32::from(range.end) as u64) - (u32::from(range.start) as u64) + 1;
-        }
-        total as usize
     }
 }

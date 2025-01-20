@@ -332,7 +332,8 @@ impl<'a> PacketSender<'a> {
         ack_frame[36..38].copy_from_slice(&port.to_be_bytes());
         ack_frame[38..42].copy_from_slice(&seq.to_be_bytes());
         ack_frame[42..46].copy_from_slice(&ack.to_be_bytes());
-        ack_frame[47] = 0b00010000;
+
+        ack_frame[47] = 0b00010000; // somehow the ack frame gets interpreted as a fin+ack packet so this has to be here until i find a solution
 
         // set checksum to 0
         ack_frame[50] = 0;
@@ -434,7 +435,6 @@ impl<'a> PacketSender<'a> {
             unsafe { &mut *self.frames.fin_frames.as_mut_ptr().add(self.fin_frame) };
 
         fin_frame[30..34].copy_from_slice(&ip.octets());
-
         fin_frame[36..38].copy_from_slice(&port.to_be_bytes());
         fin_frame[38..42].copy_from_slice(&seq.to_be_bytes());
         fin_frame[42..46].copy_from_slice(&ack.to_be_bytes());

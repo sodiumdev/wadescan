@@ -18,6 +18,7 @@ impl PacketCompleter {
         Self { device, completed }
     }
 
+    #[inline]
     pub fn tick(&mut self) {
         let mut reader = self.device.complete(self.device.available());
         while reader.read().is_some() {

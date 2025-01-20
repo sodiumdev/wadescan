@@ -8,13 +8,19 @@ use std::{
 
 use aya::maps::{MapData, RingBuf};
 use dashmap::DashMap;
-use log::{debug, trace};
+use flume::Sender;
+use log::{debug, info, trace};
 use mongodb::{bson::Document, Collection};
 use rustc_hash::FxBuildHasher;
 use tokio::io::unix::AsyncFd;
 use wadescan_common::{PacketHeader, PacketType};
 
-use crate::{checksum, ping, ping::PingParseError, sender::PacketSender};
+use crate::{
+    checksum, ping,
+    ping::{PingParseError, RawLatest},
+    sender::PacketSender,
+    shared::{ServerInfo, SharedState},
+};
 
 pub struct ConnectionState {
     data: Vec<u8>,
@@ -37,7 +43,14 @@ pub struct Responder<'a> {
     fd: AsyncFd<RingBuf<MapData>>,
     seed: u64,
 
+    server_sender: Sender<ServerInfo>,
     ping_data: &'static [u8],
+}
+
+#[repr(u8)]
+pub enum TickResult {
+    Continue,
+    Stop,
 }
 
 impl<'a> Responder<'a> {
@@ -48,6 +61,7 @@ impl<'a> Responder<'a> {
         seed: u64,
         ring_buf: RingBuf<MapData>,
         sender: PacketSender<'a>,
+        server_sender: Sender<ServerInfo>,
         ping_data: &'static [u8],
     ) -> Option<Self> {
         let fd = AsyncFd::new(ring_buf).ok()?;
@@ -61,13 +75,17 @@ impl<'a> Responder<'a> {
             fd,
             seed,
 
+            server_sender,
             ping_data,
         })
     }
 
     #[inline]
-    pub async fn tick(&mut self) -> Option<()> {
-        let mut guard = self.fd.readable_mut().await.ok()?;
+    pub async fn tick(&mut self) -> TickResult {
+        let Ok(mut guard) = self.fd.readable_mut().await else {
+            return TickResult::Stop;
+        };
+
         let ring_buf = guard.get_inner_mut();
 
         while let Some(read) = ring_buf.next() {
@@ -157,11 +175,19 @@ impl<'a> Responder<'a> {
 
                     match ping_response {
                         Ok(data) => {
-                            // TODO: store this!!!
-                            println!(
-                                "response from {ip}:{port} ; {}",
-                                String::from_utf8_lossy(&data)
-                            );
+                            info!("found 1 ({ip}:{port})");
+
+                            if let Ok(mut raw) = serde_json::from_slice::<RawLatest>(&data) {
+                                raw.raw_json = data;
+
+                                if let Ok(response) = raw.try_into() {
+                                    _ = self.server_sender.try_send(ServerInfo {
+                                        ip,
+                                        port,
+                                        response,
+                                    });
+                                }
+                            }
 
                             self.sender.send_ack(&ip, port, ack, remote_seq);
                             self.sender.send_fin(&ip, port, ack, remote_seq);
@@ -203,7 +229,7 @@ impl<'a> Responder<'a> {
 
         guard.clear_ready();
 
-        Some(())
+        TickResult::Continue
     }
 }
 

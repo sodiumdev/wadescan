@@ -1,6 +1,6 @@
+use std::{fs, time::Duration};
+
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::time::Duration;
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Configfile {
@@ -16,34 +16,38 @@ pub struct Configfile {
 pub struct DatabaseConfig {
     pub url: String,
     pub name: String,
-    pub collection_name: String
+    pub collection_name: String,
 }
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct PingConfig {
     pub address: String,
     pub port: u16,
-    pub protocol_version: i32
+    pub protocol_version: i32,
 }
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct ScannerConfig {
-    pub interface_name: String
+    pub interface_name: String,
+    pub tick_interval: Duration,
 }
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct PurgerConfig {
     pub interval: Duration,
-    pub timeout: Duration
+    pub timeout: Duration,
 }
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct PrinterConfig {
-    pub interval: Duration
+    pub interval: Duration,
 }
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct SenderConfig {
+    pub umem_size: u8,
+    pub complete_size: u8,
+    pub tx_size: u8,
 }
 
 pub fn parse_file(input: &str) -> Option<Configfile> {

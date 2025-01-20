@@ -24,3 +24,6 @@ secs = 5
 nanos = 0
 
 [sender]
+umem_size = 30
+complete_size = 26
+tx_size = 26
