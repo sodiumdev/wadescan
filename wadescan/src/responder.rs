@@ -12,7 +12,7 @@ use rustc_hash::FxBuildHasher;
 use tokio::io::unix::AsyncFd;
 use wadescan_common::{PacketHeader, PacketType};
 use crate::{checksum, ping};
-use crate::ping::{RawLatest, Response};
+use crate::ping::{PingParseError, RawLatest, Response};
 use crate::sender::PacketSender;
 
 pub struct ConnectionState {
@@ -100,10 +100,12 @@ impl<'a> Responder<'a> {
 
                     let len = unsafe { ptr::read_unaligned(read.cast::<u16>()) };
                     if len == 0 {
-                        debug!("Received ACK without data");
+                        debug!("received ACK without data");
 
                         continue
                     }
+                    
+                    debug!("received ACK with {} bytes", len);
 
                     let data = unsafe { from_raw_parts(read.add(size_of::<u16>()), len as usize) };
 
@@ -133,42 +135,62 @@ impl<'a> Responder<'a> {
                             continue;
                         }
 
-                        self.connections.insert(
-                            (ip, port),
-                            ConnectionState {
-                                data: data.to_vec(),
-                                remote_seq,
-                                local_seq: ack,
-                                started: Instant::now(),
-                                fin_sent: false,
-                            },
-                        );
-
-                        ping::parse_response(data)
-                    };
-
-                    self.sender.send_ack(
-                        &ip,
-                        port,
-                        ack,
-                        remote_seq
-                    );
-
-                    if let Ok(data) = ping_response {
-                        if let Ok(mut response) = serde_json::from_slice::<RawLatest>(&data) {
-                            response.raw_json = data;
-
-                            if let Ok(response) = TryInto::<Response>::try_into(response) {
-                                println!("{response:?}");
+                        
+                        let response = ping::parse_response(data);
+                        match &response {
+                            Err(PingParseError::Invalid) => {}
+                            
+                            _ => {
+                                self.connections.insert(
+                                    (ip, port),
+                                    ConnectionState {
+                                        data: data.to_vec(),
+                                        remote_seq,
+                                        local_seq: ack,
+                                        started: Instant::now(),
+                                        fin_sent: false,
+                                    },
+                                );
                             }
-                        }
+                        };
+                        
+                        response
+                    };
+                    
+                    match ping_response { 
+                        Ok(data) => {
+                            if let Ok(mut response) = serde_json::from_slice::<RawLatest>(&data) {
+                                response.raw_json = data;
 
-                        self.sender.send_fin(
-                            &ip,
-                            port,
-                            ack,
-                            remote_seq
-                        );
+                                if let Ok(response) = TryInto::<Response>::try_into(response) {
+                                    println!("{response:?}");
+                                }
+                            }
+
+                            self.sender.send_ack(
+                                &ip,
+                                port,
+                                ack,
+                                remote_seq
+                            );
+
+                            self.sender.send_fin(
+                                &ip,
+                                port,
+                                ack,
+                                remote_seq
+                            );
+                        }
+                        
+                        Err(PingParseError::Invalid) => {},
+                        Err(PingParseError::Incomplete) => {
+                            self.sender.send_ack(
+                                &ip,
+                                port,
+                                ack,
+                                remote_seq
+                            );
+                        },
                     }
                 }
 

@@ -3,7 +3,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 #[repr(u8)]
-pub enum PingError {
+pub enum PingParseError {
     Invalid,
     Incomplete,
 }
@@ -67,10 +67,10 @@ fn read_varint(ip: &mut usize, buffer: &[u8]) -> Option<i32> {
 }
 
 #[inline(always)]
-pub fn parse_response(response: &[u8]) -> Result<Vec<u8>, PingError> {
+pub fn parse_response(response: &[u8]) -> Result<Vec<u8>, PingParseError> {
     let mut ip = 0;
     for _ in 0..5 {
-        let byte = response.get(ip).ok_or(PingError::Invalid)?;
+        let byte = response.get(ip).ok_or(PingParseError::Invalid)?;
         ip += 1;
 
         if byte & 0b1000_0000 == 0 {
@@ -78,15 +78,15 @@ pub fn parse_response(response: &[u8]) -> Result<Vec<u8>, PingError> {
         }
     }
 
-    let packet_id = read_varint(&mut ip, response).ok_or(PingError::Invalid)?;
-    let response_length = read_varint(&mut ip, response).ok_or(PingError::Invalid)?;
+    let packet_id = read_varint(&mut ip, response).ok_or(PingParseError::Invalid)?;
+    let response_length = read_varint(&mut ip, response).ok_or(PingParseError::Invalid)?;
     if packet_id != 0x00 || response_length < 0 {
-        return Err(PingError::Invalid)
+        return Err(PingParseError::Invalid)
     }
 
     let status_buffer = &response[ip..];
     if status_buffer.len() < response_length as usize {
-        return Err(PingError::Incomplete)
+        return Err(PingParseError::Incomplete)
     }
 
     Ok(status_buffer.to_vec())
