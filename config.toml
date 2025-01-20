@@ -1,5 +1,5 @@
 [database]
-url = "mongodb://myUserAdmin:Enes1128%23@78.189.59.154:27017"
+url = "mongodb://REPLACE-ME"
 name = "diddy"
 collection_name = "party"
 
