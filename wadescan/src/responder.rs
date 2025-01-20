@@ -1,19 +1,20 @@
-use std::net::Ipv4Addr;
-use std::ptr;
-use std::slice::from_raw_parts;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    net::Ipv4Addr,
+    ptr,
+    slice::from_raw_parts,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
 use aya::maps::{MapData, RingBuf};
 use dashmap::DashMap;
 use log::debug;
-use mongodb::bson::Document;
-use mongodb::Collection;
+use mongodb::{bson::Document, Collection};
 use rustc_hash::FxBuildHasher;
 use tokio::io::unix::AsyncFd;
 use wadescan_common::{PacketHeader, PacketType};
-use crate::{checksum, ping};
-use crate::ping::{PingParseError, RawLatest, Response};
-use crate::sender::PacketSender;
+
+use crate::{checksum, ping, ping::PingParseError, sender::PacketSender};
 
 pub struct ConnectionState {
     data: Vec<u8>,
@@ -41,7 +42,14 @@ pub struct Responder<'a> {
 
 impl<'a> Responder<'a> {
     #[inline]
-    pub fn new(collection: Collection<Document>, connections: ConnectionMap, seed: u64, ring_buf: RingBuf<MapData>, sender: PacketSender<'a>, ping_data: &'static [u8]) -> Option<Self> {
+    pub fn new(
+        collection: Collection<Document>,
+        connections: ConnectionMap,
+        seed: u64,
+        ring_buf: RingBuf<MapData>,
+        sender: PacketSender<'a>,
+        ping_data: &'static [u8],
+    ) -> Option<Self> {
         let fd = AsyncFd::new(ring_buf).ok()?;
 
         Some(Self {
@@ -77,22 +85,12 @@ impl<'a> Responder<'a> {
                     if ack != checksum::cookie(&ip, port, self.seed) + 1 {
                         debug!("invalid cookie at SYN+ACK");
 
-                        continue
+                        continue;
                     }
 
-                    self.sender.send_ack(
-                        &ip,
-                        port,
-                        ack,
-                        seq + 1
-                    );
+                    self.sender.send_ack(&ip, port, ack, seq + 1);
 
-                    self.sender.send_psh(
-                        &ip,
-                        port,
-                        ack,
-                        seq + 1
-                    );
+                    self.sender.send_psh(&ip, port, ack, seq + 1);
                 }
 
                 PacketType::Ack => {
@@ -100,28 +98,25 @@ impl<'a> Responder<'a> {
 
                     let len = unsafe { ptr::read_unaligned(read.cast::<u16>()) };
                     if len == 0 {
-                        debug!("received ACK without data");
+                        debug!("received ACK without data from {}:{}", ip, port);
 
-                        continue
+                        continue;
                     }
-                    
-                    debug!("received ACK with {} bytes", len);
+
+                    debug!("received ACK with {} bytes from {}:{}", len, ip, port);
 
                     let data = unsafe { from_raw_parts(read.add(size_of::<u16>()), len as usize) };
 
                     let remote_seq = seq.wrapping_add(len as u32);
-                    let ping_response = if let Some(mut conn) = self.connections.get_mut(&(ip, port)) {
+                    let ping_response = if let Some(mut conn) =
+                        self.connections.get_mut(&(ip, port))
+                    {
                         if seq != conn.remote_seq {
                             debug!("got wrong seq number! this is probably because of a retransmission");
 
-                            self.sender.send_ack(
-                                &ip,
-                                port,
-                                ack,
-                                conn.remote_seq
-                            );
+                            self.sender.send_ack(&ip, port, ack, conn.remote_seq);
 
-                            continue
+                            continue;
                         }
 
                         conn.remote_seq = remote_seq;
@@ -129,17 +124,19 @@ impl<'a> Responder<'a> {
 
                         ping::parse_response(&conn.data)
                     } else {
-                        if ack != checksum::cookie(&ip, port, self.seed).wrapping_add((self.ping_data.len() + 1) as u32) {
+                        if ack
+                            != checksum::cookie(&ip, port, self.seed)
+                                .wrapping_add((self.ping_data.len() + 1) as u32)
+                        {
                             debug!("cookie mismatch when reading data from: {}", ip);
 
                             continue;
                         }
 
-                        
                         let response = ping::parse_response(data);
                         match &response {
                             Err(PingParseError::Invalid) => {}
-                            
+
                             _ => {
                                 self.connections.insert(
                                     (ip, port),
@@ -153,63 +150,33 @@ impl<'a> Responder<'a> {
                                 );
                             }
                         };
-                        
+
                         response
                     };
-                    
-                    match ping_response { 
+
+                    match ping_response {
                         Ok(data) => {
-                            if let Ok(mut response) = serde_json::from_slice::<RawLatest>(&data) {
-                                response.raw_json = data;
+                            // TODO: store this!!!
+                            println!("{}", String::from_utf8_lossy(&data));
 
-                                if let Ok(response) = TryInto::<Response>::try_into(response) {
-                                    println!("{response:?}");
-                                }
-                            }
+                            self.sender.send_ack(&ip, port, ack, remote_seq);
 
-                            self.sender.send_ack(
-                                &ip,
-                                port,
-                                ack,
-                                remote_seq
-                            );
-
-                            self.sender.send_fin(
-                                &ip,
-                                port,
-                                ack,
-                                remote_seq
-                            );
+                            self.sender.send_fin(&ip, port, ack, remote_seq);
                         }
-                        
-                        Err(PingParseError::Invalid) => {},
+
+                        Err(PingParseError::Invalid) => {}
                         Err(PingParseError::Incomplete) => {
-                            self.sender.send_ack(
-                                &ip,
-                                port,
-                                ack,
-                                remote_seq
-                            );
-                        },
+                            self.sender.send_ack(&ip, port, ack, remote_seq);
+                        }
                     }
                 }
 
                 PacketType::Fin => {
                     if let Some(mut conn) = self.connections.get_mut(&(ip, port)) {
-                        self.sender.send_ack(
-                            &ip,
-                            port,
-                            conn.local_seq,
-                            seq + 1
-                        );
+                        self.sender.send_ack(&ip, port, conn.local_seq, seq + 1);
 
                         if !conn.fin_sent {
-                            self.sender.send_fin(
-                                &ip,
-                                port,
-                                conn.local_seq,
-                                seq + 1
-                            );
+                            self.sender.send_fin(&ip, port, conn.local_seq, seq + 1);
 
                             conn.fin_sent = true;
                         }
@@ -217,17 +184,12 @@ impl<'a> Responder<'a> {
                         if !conn.data.is_empty() {
                             self.connections.remove(&(ip, port));
                         }
+                    } else {
+                        self.sender.send_ack(&ip, port, ack, seq + 1);
                     }
-
-                    self.sender.send_ack(
-                        &ip,
-                        port,
-                        ack,
-                        seq + 1
-                    );
                 }
 
-                _ => unreachable!()
+                _ => unreachable!(),
             };
         }
 
@@ -245,17 +207,22 @@ pub struct Purger {
 
 impl Purger {
     #[inline]
-    pub fn new(connections: ConnectionMap, purge_interval: Duration, ping_timeout: Duration) -> Self {
+    pub fn new(
+        connections: ConnectionMap,
+        purge_interval: Duration,
+        ping_timeout: Duration,
+    ) -> Self {
         Self {
             connections,
             purge_interval,
-            ping_timeout
+            ping_timeout,
         }
     }
 
     #[inline]
     pub async fn tick(&self) {
-        self.connections.retain(|_, conn| conn.started.elapsed() <= self.ping_timeout);
+        self.connections
+            .retain(|_, conn| conn.started.elapsed() <= self.ping_timeout);
 
         tokio::time::sleep(self.purge_interval).await;
     }
