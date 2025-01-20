@@ -3,6 +3,7 @@
 ## Prerequisites
 
 1. up-to-date mainline kernel
+2. block your os from closing the connections: `sudo iptables -A INPUT -p tcp --dport 43169 -j DROP`
 2. stable rust toolchains: `rustup toolchain install stable`
 3. nightly rust toolchains: `rustup toolchain install nightly --component rust-src`
 4. (if cross-compiling) rustup target: `rustup target add ${ARCH}-unknown-linux-musl`
