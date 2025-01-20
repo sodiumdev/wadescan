@@ -158,13 +158,19 @@ impl<'a> Responder<'a> {
                     match ping_response {
                         Ok(data) => {
                             // TODO: store this!!!
-                            println!("{}", String::from_utf8_lossy(&data));
+                            println!(
+                                "response from {ip}:{port} ; {}",
+                                String::from_utf8_lossy(&data)
+                            );
 
                             self.sender.send_ack(&ip, port, ack, remote_seq);
                             self.sender.send_fin(&ip, port, ack, remote_seq);
                         }
 
-                        Err(PingParseError::Invalid) => {}
+                        Err(PingParseError::Invalid) => {
+                            debug!("invalid response from {ip}:{port}");
+                        }
+
                         Err(PingParseError::Incomplete) => {
                             self.sender.send_ack(&ip, port, ack, remote_seq);
                         }
@@ -172,8 +178,6 @@ impl<'a> Responder<'a> {
                 }
 
                 PacketType::Fin => {
-                    debug!("received FIN");
-
                     if let Some(mut conn) = self.connections.get_mut(&(ip, port)) {
                         self.sender.send_ack(&ip, port, conn.local_seq, seq + 1);
 
@@ -184,6 +188,8 @@ impl<'a> Responder<'a> {
                         }
 
                         if !conn.data.is_empty() {
+                            drop(conn);
+
                             self.connections.remove(&(ip, port));
                         }
                     } else {
