@@ -1,8 +1,9 @@
 use std::net::Ipv4Addr;
 
+use strength_reduce::StrengthReducedUsize;
 use xdpilone::{xdp::XdpDesc, BufIdx, RingTx, Umem};
 
-use crate::checksum;
+use crate::{checksum, FRAME_SIZE};
 
 static SYN_PACKET: [u8; 62] = [
     // ETHER : [0..14]
@@ -70,6 +71,9 @@ pub enum SenderKind {
 }
 
 pub struct Frames<'a> {
+    // ppf = packets per frame
+    psh_ppf: StrengthReducedUsize,
+
     syn_frames: Vec<Frame<'a>>,
     ack_frames: Vec<Frame<'a>>,
     psh_frames: Vec<Frame<'a>>,
@@ -83,10 +87,10 @@ pub struct Frames<'a> {
 pub struct PacketSender<'a> {
     frames: Frames<'a>,
 
-    syn_frame: usize,
-    ack_frame: usize,
-    psh_frame: usize,
-    fin_frame: usize,
+    syn_packet: usize,
+    ack_packet: usize,
+    psh_packet: usize,
+    fin_packet: usize,
 
     tx: Tx,
 }
@@ -97,10 +101,10 @@ impl<'a> PacketSender<'a> {
         Some(Self {
             frames,
 
-            syn_frame: 0,
-            ack_frame: 0,
-            psh_frame: 0,
-            fin_frame: 0,
+            syn_packet: 0,
+            ack_packet: 0,
+            psh_packet: 0,
+            fin_packet: 0,
 
             tx: Tx(tx),
         })
@@ -122,7 +126,11 @@ impl<'a> PacketSender<'a> {
 
         let frames = umem.len_frames() / 8;
 
+        let psh_ppf = (FRAME_SIZE as usize).div_floor(54 + ping_data.len());
+
         Frames {
+            psh_ppf: StrengthReducedUsize::new(psh_ppf),
+
             syn_frames: Self::syn_frames(
                 offset,
                 frames,
@@ -142,6 +150,7 @@ impl<'a> PacketSender<'a> {
             psh_frames: Self::psh_frames(
                 offset,
                 frames,
+                psh_ppf,
                 gateway_mac,
                 interface_mac,
                 &source_ip,
@@ -176,11 +185,15 @@ impl<'a> PacketSender<'a> {
                 let mut frame = umem.frame(BufIdx(n)).unwrap();
                 let base = unsafe { frame.addr.as_mut() };
 
-                base[..62].copy_from_slice(&SYN_PACKET[..]);
+                for packet in 0..64 {
+                    let start = 62 * packet;
 
-                base[0..6].copy_from_slice(gateway_mac);
-                base[6..12].copy_from_slice(interface_mac);
-                base[26..30].copy_from_slice(&source_ip.octets());
+                    base[start..(start + 62)].copy_from_slice(&SYN_PACKET[..]);
+
+                    base[start..(start + 6)].copy_from_slice(gateway_mac);
+                    base[(start + 6)..(start + 12)].copy_from_slice(interface_mac);
+                    base[(start + 26)..(start + 30)].copy_from_slice(&source_ip.octets());
+                }
 
                 (frame.offset, base)
             })
@@ -201,12 +214,16 @@ impl<'a> PacketSender<'a> {
                 let mut frame = umem.frame(BufIdx(n)).unwrap();
                 let base = unsafe { frame.addr.as_mut() };
 
-                base[..54].copy_from_slice(&OTHER_PACKET[..]);
+                for packet in 0..64 {
+                    let start = 54 * packet;
 
-                base[0..6].copy_from_slice(gateway_mac);
-                base[6..12].copy_from_slice(interface_mac);
-                base[26..30].copy_from_slice(&source_ip.octets());
-                base[47] = 0b00010000;
+                    base[start..(start + 54)].copy_from_slice(&OTHER_PACKET[..]);
+
+                    base[start..(start + 6)].copy_from_slice(gateway_mac);
+                    base[(start + 6)..(start + 12)].copy_from_slice(interface_mac);
+                    base[(start + 26)..(start + 30)].copy_from_slice(&source_ip.octets());
+                    base[start + 47] = 0b00010000;
+                }
 
                 (frame.offset, base)
             })
@@ -217,6 +234,7 @@ impl<'a> PacketSender<'a> {
     fn psh_frames(
         offset: u32,
         frames: u32,
+        ppf: usize,
         gateway_mac: &[u8; 6],
         interface_mac: &[u8; 6],
         source_ip: &Ipv4Addr,
@@ -228,14 +246,18 @@ impl<'a> PacketSender<'a> {
                 let mut frame = umem.frame(BufIdx(n)).unwrap();
                 let base = unsafe { frame.addr.as_mut() };
 
-                base[..54].copy_from_slice(&OTHER_PACKET[..]);
+                for packet in 0..ppf {
+                    let start = 54 * packet;
+                    let end = start + 54;
 
-                base[0..6].copy_from_slice(gateway_mac);
-                base[6..12].copy_from_slice(interface_mac);
-                base[26..30].copy_from_slice(&source_ip.octets());
-                base[17] = 40 + ping_data.len() as u8;
-                base[47] = 0b00011000;
-                base[54..(54 + ping_data.len())].copy_from_slice(ping_data);
+                    base[start..end].copy_from_slice(&OTHER_PACKET[..]);
+
+                    base[start..(start + 6)].copy_from_slice(gateway_mac);
+                    base[(start + 6)..(start + 12)].copy_from_slice(interface_mac);
+                    base[(start + 26)..(start + 30)].copy_from_slice(&source_ip.octets());
+                    base[start + 47] = 0b00010000;
+                    base[end..(end + ping_data.len())].copy_from_slice(ping_data);
+                }
 
                 (frame.offset, base)
             })
@@ -256,12 +278,16 @@ impl<'a> PacketSender<'a> {
                 let mut frame = umem.frame(BufIdx(n)).unwrap();
                 let base = unsafe { frame.addr.as_mut() };
 
-                base[..54].copy_from_slice(&OTHER_PACKET[..]);
+                for packet in 0..64 {
+                    let start = 54 * packet;
 
-                base[0..6].copy_from_slice(gateway_mac);
-                base[6..12].copy_from_slice(interface_mac);
-                base[26..30].copy_from_slice(&source_ip.octets());
-                base[47] = 0b00010001;
+                    base[start..(start + 54)].copy_from_slice(&OTHER_PACKET[..]);
+
+                    base[start..(start + 6)].copy_from_slice(gateway_mac);
+                    base[(start + 6)..(start + 12)].copy_from_slice(interface_mac);
+                    base[(start + 26)..(start + 30)].copy_from_slice(&source_ip.octets());
+                    base[start + 47] = 0b00010000;
+                }
 
                 (frame.offset, base)
             })
@@ -270,41 +296,50 @@ impl<'a> PacketSender<'a> {
 
     #[inline]
     pub fn send_syn(&mut self, ip: &Ipv4Addr, port: u16, seed: u64) {
-        self.syn_frame += 1;
-        if self.syn_frame >= self.frames.syn_frames.len() {
-            self.syn_frame = 0;
+        self.syn_packet += 1;
+
+        let mut syn_frame = self.syn_packet >> 6;
+        if syn_frame >= self.frames.syn_frames.len() {
+            self.syn_packet = 0;
+            syn_frame = 0;
         }
 
         // SAFETY: bound checks are done above
-        let (addr, syn_frame) =
-            unsafe { &mut *self.frames.syn_frames.as_mut_ptr().add(self.syn_frame) };
+        let (addr, syn_frame) = unsafe { &mut *self.frames.syn_frames.as_mut_ptr().add(syn_frame) };
 
-        syn_frame[30..34].copy_from_slice(&ip.octets());
-        syn_frame[36..38].copy_from_slice(&port.to_be_bytes());
-        syn_frame[38..42].copy_from_slice(&checksum::cookie(ip, port, seed).to_be_bytes()); // sequence
+        let start = 62 * (self.syn_packet % 63);
+
+        syn_frame[(start + 30)..(start + 34)].copy_from_slice(&ip.octets());
+        syn_frame[(start + 36)..(start + 38)].copy_from_slice(&port.to_be_bytes());
+        syn_frame[(start + 38)..(start + 42)]
+            .copy_from_slice(&checksum::cookie(ip, port, seed).to_be_bytes()); // sequence
 
         // set checksum to 0
-        syn_frame[50] = 0;
-        syn_frame[51] = 0;
+        syn_frame[start + 50] = 0;
+        syn_frame[start + 51] = 0;
 
-        // checksum is not skipped while calculating!!! TODO: fix without any performance drops
+        // checksum is not skipped while calculating!!!
         {
-            let checksum = checksum::tcp(&syn_frame[34..62], &self.frames.source_ip, ip);
+            let checksum = checksum::tcp(
+                &syn_frame[(start + 34)..(start + 62)],
+                &self.frames.source_ip,
+                ip,
+            );
 
-            syn_frame[50..52].copy_from_slice(&checksum.to_be_bytes());
+            syn_frame[(start + 50)..(start + 52)].copy_from_slice(&checksum.to_be_bytes());
         }
 
         // no need to set the checksum to 0 here because it's skipped while calculating
         {
-            let checksum = checksum::ipv4(&syn_frame[14..34]);
+            let checksum = checksum::ipv4(&syn_frame[(start + 14)..(start + 34)]);
 
-            syn_frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+            syn_frame[(start + 24)..(start + 26)].copy_from_slice(&checksum.to_be_bytes());
         }
 
         {
             let mut writer = self.tx.0.transmit(1);
             writer.insert_once(XdpDesc {
-                addr: *addr,
+                addr: *addr + start as u64,
                 len: 62,
                 options: 0,
             });
@@ -319,44 +354,50 @@ impl<'a> PacketSender<'a> {
 
     #[inline]
     pub fn send_ack(&mut self, ip: &Ipv4Addr, port: u16, seq: u32, ack: u32) {
-        self.ack_frame += 1;
-        if self.ack_frame >= self.frames.ack_frames.len() {
-            self.ack_frame = 0;
+        self.ack_packet += 1;
+
+        let mut ack_frame = self.ack_packet >> 6;
+        if ack_frame >= self.frames.ack_frames.len() {
+            self.ack_packet = 0;
+            ack_frame = 0;
         }
 
         // SAFETY: bound checks are done above
-        let (addr, ack_frame) =
-            unsafe { &mut *self.frames.ack_frames.as_mut_ptr().add(self.ack_frame) };
+        let (addr, ack_frame) = unsafe { &mut *self.frames.ack_frames.as_mut_ptr().add(ack_frame) };
 
-        ack_frame[30..34].copy_from_slice(&ip.octets());
-        ack_frame[36..38].copy_from_slice(&port.to_be_bytes());
-        ack_frame[38..42].copy_from_slice(&seq.to_be_bytes());
-        ack_frame[42..46].copy_from_slice(&ack.to_be_bytes());
+        let start = 62 * (self.ack_packet & 63);
 
-        ack_frame[47] = 0b00010000; // somehow the ack frame gets interpreted as a fin+ack packet so this has to be here until i find a solution
+        ack_frame[(start + 30)..(start + 34)].copy_from_slice(&ip.octets());
+        ack_frame[(start + 36)..(start + 38)].copy_from_slice(&port.to_be_bytes());
+        ack_frame[(start + 38)..(start + 42)].copy_from_slice(&seq.to_be_bytes());
+        ack_frame[(start + 42)..(start + 46)].copy_from_slice(&ack.to_be_bytes());
 
         // set checksum to 0
-        ack_frame[50] = 0;
-        ack_frame[51] = 0;
+        ack_frame[start + 50] = 0;
+        ack_frame[start + 51] = 0;
 
-        // checksum is not skipped while calculating!!! TODO: fix without any performance drops
+        // checksum is not skipped while calculating!!!
         {
-            let checksum = checksum::tcp(&ack_frame[34..54], &self.frames.source_ip, ip);
+            let checksum = checksum::tcp(
+                &ack_frame[(start + 34)..(start + 54)],
+                &self.frames.source_ip,
+                ip,
+            );
 
             ack_frame[50..52].copy_from_slice(&checksum.to_be_bytes());
         }
 
         // no need to set the checksum to 0 here because it's skipped while calculating
         {
-            let checksum = checksum::ipv4(&ack_frame[14..34]);
+            let checksum = checksum::ipv4(&ack_frame[(start + 14)..(start + 34)]);
 
-            ack_frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+            ack_frame[(start + 24)..(start + 26)].copy_from_slice(&checksum.to_be_bytes());
         }
 
         {
             let mut writer = self.tx.0.transmit(1);
             writer.insert_once(XdpDesc {
-                addr: *addr,
+                addr: *addr + start as u64,
                 len: 54,
                 options: 0,
             });
@@ -371,47 +412,52 @@ impl<'a> PacketSender<'a> {
 
     #[inline]
     pub fn send_psh(&mut self, ip: &Ipv4Addr, port: u16, seq: u32, ack: u32) {
-        self.psh_frame += 1;
-        if self.psh_frame >= self.frames.psh_frames.len() {
-            self.psh_frame = 0;
+        self.psh_packet += 1;
+
+        let mut psh_frame = self.psh_packet / self.frames.psh_ppf;
+        if psh_frame >= self.frames.psh_frames.len() {
+            self.psh_packet = 0;
+            psh_frame = 0;
         }
 
         // SAFETY: bound checks are done above
-        let (addr, psh_frame) =
-            unsafe { &mut *self.frames.psh_frames.as_mut_ptr().add(self.psh_frame) };
+        let (addr, psh_frame) = unsafe { &mut *self.frames.psh_frames.as_mut_ptr().add(psh_frame) };
 
-        psh_frame[30..34].copy_from_slice(&ip.octets());
-        psh_frame[36..38].copy_from_slice(&port.to_be_bytes());
-        psh_frame[38..42].copy_from_slice(&seq.to_be_bytes());
-        psh_frame[42..46].copy_from_slice(&ack.to_be_bytes());
+        let len = 54 + self.frames.ping_data_len;
+        let start = len as usize * (self.psh_packet % self.frames.psh_ppf);
+
+        psh_frame[(start + 30)..(start + 34)].copy_from_slice(&ip.octets());
+        psh_frame[(start + 36)..(start + 38)].copy_from_slice(&port.to_be_bytes());
+        psh_frame[(start + 38)..(start + 42)].copy_from_slice(&seq.to_be_bytes());
+        psh_frame[(start + 42)..(start + 46)].copy_from_slice(&ack.to_be_bytes());
 
         // set checksum to 0
-        psh_frame[50] = 0;
-        psh_frame[51] = 0;
+        psh_frame[start + 50] = 0;
+        psh_frame[start + 51] = 0;
 
-        // checksum is not skipped while calculating!!! TODO: fix without any performance drops
+        // checksum is not skipped while calculating!!!
         {
             let checksum = checksum::tcp(
-                &psh_frame[34..(54 + self.frames.ping_data_len as usize)],
+                &psh_frame[(start + 34)..(start + len as usize)],
                 &self.frames.source_ip,
                 ip,
             );
 
-            psh_frame[50..52].copy_from_slice(&checksum.to_be_bytes());
+            psh_frame[(start + 50)..(start + 52)].copy_from_slice(&checksum.to_be_bytes());
         }
 
         // no need to set the checksum to 0 here because it's skipped while calculating
         {
-            let checksum = checksum::ipv4(&psh_frame[14..34]);
+            let checksum = checksum::ipv4(&psh_frame[(start + 14)..(start + 34)]);
 
-            psh_frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+            psh_frame[(start + 24)..(start + 26)].copy_from_slice(&checksum.to_be_bytes());
         }
 
         {
             let mut writer = self.tx.0.transmit(1);
             writer.insert_once(XdpDesc {
                 addr: *addr,
-                len: 54 + self.frames.ping_data_len,
+                len,
                 options: 0,
             });
 
@@ -425,42 +471,50 @@ impl<'a> PacketSender<'a> {
 
     #[inline]
     pub fn send_fin(&mut self, ip: &Ipv4Addr, port: u16, seq: u32, ack: u32) {
-        self.fin_frame += 1;
-        if self.fin_frame >= self.frames.fin_frames.len() {
-            self.fin_frame = 0;
+        self.fin_packet += 1;
+
+        let mut fin_frame = self.fin_packet >> 6;
+        if fin_frame >= self.frames.fin_frames.len() {
+            self.fin_packet = 0;
+            fin_frame = 0;
         }
 
         // SAFETY: bound checks are done above
-        let (addr, fin_frame) =
-            unsafe { &mut *self.frames.fin_frames.as_mut_ptr().add(self.fin_frame) };
+        let (addr, fin_frame) = unsafe { &mut *self.frames.fin_frames.as_mut_ptr().add(fin_frame) };
 
-        fin_frame[30..34].copy_from_slice(&ip.octets());
-        fin_frame[36..38].copy_from_slice(&port.to_be_bytes());
-        fin_frame[38..42].copy_from_slice(&seq.to_be_bytes());
-        fin_frame[42..46].copy_from_slice(&ack.to_be_bytes());
+        let start = 54 * (self.fin_packet & 63);
+
+        fin_frame[(start + 30)..(start + 34)].copy_from_slice(&ip.octets());
+        fin_frame[(start + 36)..(start + 38)].copy_from_slice(&port.to_be_bytes());
+        fin_frame[(start + 38)..(start + 42)].copy_from_slice(&seq.to_be_bytes());
+        fin_frame[(start + 42)..(start + 46)].copy_from_slice(&ack.to_be_bytes());
 
         // set checksum to 0
-        fin_frame[50] = 0;
-        fin_frame[51] = 0;
+        fin_frame[start + 50] = 0;
+        fin_frame[start + 51] = 0;
 
-        // checksum is not skipped while calculating!!! TODO: fix without any performance drops
+        // checksum is not skipped while calculating!!!
         {
-            let checksum = checksum::tcp(&fin_frame[34..54], &self.frames.source_ip, ip);
+            let checksum = checksum::tcp(
+                &fin_frame[(start + 34)..(start + 54)],
+                &self.frames.source_ip,
+                ip,
+            );
 
-            fin_frame[50..52].copy_from_slice(&checksum.to_be_bytes());
+            fin_frame[(start + 50)..(start + 52)].copy_from_slice(&checksum.to_be_bytes());
         }
 
         // no need to set the checksum to 0 here because it's skipped while calculating
         {
-            let checksum = checksum::ipv4(&fin_frame[14..34]);
+            let checksum = checksum::ipv4(&fin_frame[(start + 14)..(start + 34)]);
 
-            fin_frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+            fin_frame[(start + 24)..(start + 26)].copy_from_slice(&checksum.to_be_bytes());
         }
 
         {
             let mut writer = self.tx.0.transmit(1);
             writer.insert_once(XdpDesc {
-                addr: *addr,
+                addr: *addr + start as u64,
                 len: 54,
                 options: 0,
             });

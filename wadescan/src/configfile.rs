@@ -1,6 +1,8 @@
 use std::{fs, time::Duration};
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use serde_with::{serde_as, DurationSeconds};
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Configfile {
@@ -31,14 +33,20 @@ pub struct ScannerConfig {
     pub interface_name: String,
 }
 
+#[serde_as]
 #[derive(Default, Serialize, Deserialize)]
 pub struct PurgerConfig {
+    #[serde_as(as = "DurationSeconds<u64>")]
     pub interval: Duration,
+
+    #[serde_as(as = "DurationSeconds<u64>")]
     pub timeout: Duration,
 }
 
+#[serde_as]
 #[derive(Default, Serialize, Deserialize)]
 pub struct PrinterConfig {
+    #[serde_as(as = "DurationSeconds<u64>")]
     pub interval: Duration,
 }
 
@@ -49,12 +57,11 @@ pub struct SenderConfig {
     pub tx_size: u8,
 }
 
-pub fn parse_file(input: &str) -> Option<Configfile> {
-    let input = fs::read_to_string(input).ok()?;
+#[inline]
+pub fn parse_file(input: &str) -> anyhow::Result<Configfile> {
+    let input = fs::read_to_string(input).context(format!(
+        "couldn't find {input}, maybe you forgot to rename config.example.toml?"
+    ))?;
 
-    parse(&input)
-}
-
-fn parse(input: &str) -> Option<Configfile> {
-    toml::from_str(input).ok()
+    toml::from_str(&input).context("failed to parse TOML")
 }

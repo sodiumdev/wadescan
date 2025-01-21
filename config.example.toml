@@ -21,12 +21,12 @@ interface_name = "eth0"
 
 # Purger, this will drop stale connections
 [purger]
-interval = { secs=60 }  # drop every X seconds
-timeout = { secs=60 }   # drop stuff that's > X seconds old
+interval = 60  # drop every X seconds
+timeout = 60   # drop stuff that's >X seconds old
 
 # Printer, will show occasional debug output
 [printer]
-interval = { secs=5 }
+interval = 5 
 
 # Sender
 [sender]

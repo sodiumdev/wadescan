@@ -1,8 +1,10 @@
 use std::{fs, net::Ipv4Addr, str::FromStr};
 
 use anyhow::anyhow;
+
 use crate::range::{Ipv4Range, Ipv4Ranges};
 
+#[inline]
 pub fn parse_file(input: &str) -> anyhow::Result<Ipv4Ranges> {
     let input = fs::read_to_string(input)?;
 

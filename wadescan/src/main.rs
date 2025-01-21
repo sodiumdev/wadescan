@@ -1,4 +1,5 @@
 #![feature(const_vec_string_slice, variant_count)]
+#![feature(int_roundings)]
 
 pub mod checksum;
 pub mod completer;
@@ -31,20 +32,23 @@ use dashmap::DashMap;
 use default_net::get_interfaces;
 use mongodb::Client;
 use rustc_hash::FxBuildHasher;
-use xdpilone::{Errno, IfInfo, Socket, SocketConfig, Umem, UmemConfig};
+use xdpilone::{IfInfo, Socket, SocketConfig, Umem, UmemConfig};
 
 use crate::{
     completer::{PacketCompleter, Printer},
     responder::{Purger, Responder, TickResult},
     scanner::Scanner,
     sender::{PacketSender, SenderKind},
+    shared::FRAME_SIZE,
 };
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 6)]
-async fn main() -> Result<(), Errno> {
+async fn main() -> anyhow::Result<()> {
     env_logger::init();
 
     unsafe {
+        // set resource limit to infinity
+        // oom go brr
         libc::setrlimit(
             libc::RLIMIT_MEMLOCK,
             &libc::rlimit {
@@ -58,24 +62,28 @@ async fn main() -> Result<(), Errno> {
         env!("OUT_DIR"),
         "/wadescan"
     )))
-    .unwrap();
+    .expect("failed to load ebpf");
 
-    let ring_buf = ebpf.take_map("RING_BUF").unwrap();
-    let ring_buf = RingBuf::try_from(ring_buf).unwrap();
+    let ring_buf = ebpf
+        .take_map("RING_BUF")
+        .expect("somehow the ring buffer doesnt exist");
+    let ring_buf =
+        RingBuf::try_from(ring_buf).expect("the ring buffer isn't actually a ring buffer");
 
     _ = aya_log::EbpfLogger::init(&mut ebpf);
 
     let excludefile = excludefile::parse_file("exclude.conf").expect("failed to parse excludefile");
-
     let configfile = configfile::parse_file("config.toml").expect("failed to parse configfile");
 
     let program: &mut Xdp = ebpf
         .program_mut("wadescan")
         .expect("failed to find ebpf program")
         .try_into()
-        .expect("failed to convert program to xdp");
+        .expect("failed to convert program to xdp (how the fuck is this possible)");
 
-    program.load().expect("failed to load ebpf program");
+    program
+        .load()
+        .expect("failed to load ebpf program to the kernel");
     program
         .attach(&configfile.scanner.interface_name, XdpFlags::default())
         .context("attaching program")
@@ -83,8 +91,7 @@ async fn main() -> Result<(), Errno> {
             program
                 .attach(&configfile.scanner.interface_name, XdpFlags::SKB_MODE)
                 .context("attaching program via skb")
-        })
-        .unwrap();
+        })?;
 
     let ping_data: &[u8] = ping::build_latest_request(
         configfile.ping.protocol_version,
@@ -96,7 +103,7 @@ async fn main() -> Result<(), Errno> {
     let seed = rand::random();
 
     let umem_size = 1 << configfile.sender.umem_size;
-    let layout = Layout::from_size_align(umem_size, 16384).unwrap();
+    let layout = Layout::from_size_align(umem_size, 16384).context("validating layout")?;
     let ptr =
         NonNull::slice_from_raw_parts(unsafe { NonNull::new_unchecked(alloc(layout)) }, umem_size);
 
@@ -105,13 +112,13 @@ async fn main() -> Result<(), Errno> {
             UmemConfig {
                 fill_size: 1, // 0 won't work for some reason
                 complete_size: 1 << configfile.sender.complete_size,
-                frame_size: 1 << 12,
+                frame_size: FRAME_SIZE, // anything other than 1 << 12 won't work FOR SOME REASON
                 headroom: 0,
                 flags: 0,
             },
             ptr,
         )
-        .expect("umem creation error")
+        .expect("failed to create umem")
     };
 
     let mut iface = IfInfo::invalid();
@@ -190,7 +197,9 @@ async fn main() -> Result<(), Errno> {
 
     let (server_sender, server_receiver) = flume::unbounded();
 
-    let tx = responder_rxtx.map_tx()?;
+    let tx = responder_rxtx
+        .map_tx()
+        .expect("failed to map tx for responder");
     tokio::spawn(async move {
         let mut responder = Responder::new(
             collection_responder,
@@ -251,7 +260,7 @@ async fn main() -> Result<(), Errno> {
     );
 
     // be ready to melt your fucking network!
-    let tx = sender_rxtx.map_tx()?;
+    let tx = sender_rxtx.map_tx().expect("failed to map tx for scanner");
     let mut scanner = Scanner::new(
         collection,
         seed,
