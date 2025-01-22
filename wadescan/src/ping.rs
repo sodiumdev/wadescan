@@ -86,6 +86,8 @@ pub fn parse_response(response: &[u8]) -> Result<Vec<u8>, PingParseError> {
     Ok(status_buffer.to_vec())
 }
 
+// thanks craftping!
+
 #[derive(Debug)]
 /// The ping error type.
 pub enum Error {

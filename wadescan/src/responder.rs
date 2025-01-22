@@ -18,7 +18,7 @@ use wadescan_common::{PacketHeader, PacketType};
 use crate::{
     checksum, ping,
     ping::{PingParseError, RawLatest},
-    sender::PacketSender,
+    sender::ResponseSender,
     shared::{ServerInfo, SharedState},
 };
 
@@ -38,7 +38,7 @@ pub struct Responder<'a> {
     collection: Collection<Document>,
 
     connections: ConnectionMap,
-    sender: PacketSender<'a>,
+    sender: ResponseSender<'a>,
 
     fd: AsyncFd<RingBuf<MapData>>,
     seed: u64,
@@ -60,7 +60,7 @@ impl<'a> Responder<'a> {
         connections: ConnectionMap,
         seed: u64,
         ring_buf: RingBuf<MapData>,
-        sender: PacketSender<'a>,
+        sender: ResponseSender<'a>,
         server_sender: Sender<ServerInfo>,
         ping_data: &'static [u8],
     ) -> Option<Self> {

@@ -1,19 +1,19 @@
 // thanks mat
 
-use std::net::Ipv4Addr;
-use std::str::FromStr;
-use mongodb::bson::Document;
-use mongodb::Collection;
+use std::{net::Ipv4Addr, str::FromStr};
+
+use mongodb::{bson::Document, Collection};
 use rand::distributions::{Distribution, WeightedIndex};
 use rayon::prelude::*;
-use rustc_hash::{FxHashMap};
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+
 use crate::range::ScanRange;
 
 macro_rules! scan_mode {
     ($($variant:ident),*) => {
         #[repr(u8)]
-        #[derive(Hash, Eq, PartialEq, Copy, Clone, Serialize, Deserialize)]
+        #[derive(Debug, Hash, Eq, PartialEq, Copy, Clone, Serialize, Deserialize)]
         pub enum ScanMode {
             $($variant),*
         }
@@ -26,15 +26,15 @@ macro_rules! scan_mode {
                 }
             }
         }
-        
+
         impl FromStr for ScanMode {
             type Err = ();
-            
+
             #[inline]
             fn from_str(s: &str) -> Result<Self, Self::Err> {
                 Ok(match s {
                     $(stringify!($variant) => Self::$variant),*,
-                    
+
                     _ => return Err(())
                 })
             }
@@ -96,7 +96,7 @@ impl ScanMode {
             ScanMode::Slash32AllPorts365d => unimplemented!(),
             ScanMode::Slash32AllPortsNew => unimplemented!(),
             ScanMode::Slash32RangePorts => unimplemented!(),
-            ScanMode::Slash32RangePortsNew => unimplemented!()
+            ScanMode::Slash32RangePortsNew => unimplemented!(),
         }
     }
 }
@@ -111,7 +111,11 @@ pub struct ModePicker {
 impl ModePicker {
     #[inline]
     pub fn pick(&self) -> ScanMode {
-        if self.modes.values().all(|&count| count == 0 || count == DEFAULT_FOUND) {
+        if self
+            .modes
+            .values()
+            .all(|&count| count == 0 || count == DEFAULT_FOUND)
+        {
             return ScanMode::Slash0;
         }
 
@@ -121,7 +125,8 @@ impl ModePicker {
                 .par_iter()
                 .map(|(_, &count)| (count * count) + 1)
                 .collect::<Vec<_>>(),
-        ).unwrap();
+        )
+        .unwrap();
 
         *modes[dist.sample(&mut rand::thread_rng())].0
     }

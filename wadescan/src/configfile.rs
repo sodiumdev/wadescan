@@ -28,9 +28,13 @@ pub struct PingConfig {
     pub protocol_version: i32,
 }
 
+#[serde_as]
 #[derive(Default, Serialize, Deserialize)]
 pub struct ScannerConfig {
     pub interface_name: String,
+
+    #[serde_as(as = "DurationSeconds<u64>")]
+    pub tick_interval: Duration,
 }
 
 #[serde_as]

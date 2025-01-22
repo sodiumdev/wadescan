@@ -38,7 +38,7 @@ use crate::{
     completer::{PacketCompleter, Printer},
     responder::{Purger, Responder, TickResult},
     scanner::Scanner,
-    sender::{PacketSender, SenderKind},
+    sender::{ResponseSender, SynSender},
     shared::FRAME_SIZE,
 };
 
@@ -173,7 +173,7 @@ async fn main() -> anyhow::Result<()> {
     let source_ip = iface.ipv4.first().unwrap().addr;
 
     let gateway_mac = iface.gateway.unwrap().mac_addr.octets();
-    let iface_mac = iface.mac_addr.unwrap().octets();
+    let interface_mac = iface.mac_addr.unwrap().octets();
 
     let connections = Arc::new(DashMap::with_hasher(FxBuildHasher));
     let connections_purger = connections.clone();
@@ -186,27 +186,28 @@ async fn main() -> anyhow::Result<()> {
     let collection = database.collection(&configfile.database.collection_name);
     let collection_responder = collection.clone();
 
-    let frames = PacketSender::frames(
-        SenderKind::Responder,
+    let tx = responder_rxtx
+        .map_tx()
+        .expect("failed to map tx for responder");
+
+    let response_sender = ResponseSender::new(
+        tx,
         &gateway_mac,
-        &iface_mac,
+        &interface_mac,
         source_ip,
-        &umem,
         ping_data,
+        &umem,
     );
 
     let (server_sender, server_receiver) = flume::unbounded();
 
-    let tx = responder_rxtx
-        .map_tx()
-        .expect("failed to map tx for responder");
     tokio::spawn(async move {
         let mut responder = Responder::new(
             collection_responder,
             connections,
             seed,
             ring_buf,
-            PacketSender::new(tx, frames).expect("failed to initiate packet sender"),
+            response_sender,
             server_sender,
             ping_data,
         )
@@ -250,24 +251,15 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let frames = PacketSender::frames(
-        SenderKind::Scanner,
-        &gateway_mac,
-        &iface_mac,
-        source_ip,
-        &umem,
-        ping_data,
-    );
-
     // be ready to melt your fucking network!
     let tx = sender_rxtx.map_tx().expect("failed to map tx for scanner");
     let mut scanner = Scanner::new(
         collection,
         seed,
         excludefile,
-        PacketSender::new(tx, frames).expect("failed to initiate packet sender"),
+        SynSender::new(tx, &gateway_mac, &interface_mac, source_ip, &umem),
         server_receiver,
-        configfile.purger.timeout,
+        configfile.scanner.tick_interval,
     );
 
     loop {

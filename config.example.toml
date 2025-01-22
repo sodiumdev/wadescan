@@ -18,6 +18,8 @@ protocol_version = 767
 [scanner]
 # The interface to scan over
 interface_name = "eth0"
+# The amount of time to wait after each scan, ideally same as the purger timeout
+tick_interval = 10
 
 # Purger, this will drop stale connections
 [purger]
