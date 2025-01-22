@@ -4,11 +4,8 @@
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
 pub enum PacketType {
     SynAck = 0,
-    Syn = 1,
-    Ack = 2,
-    Rst = 3,
-    Fin = 4,
-    PshAck = 5,
+    Ack = 1,
+    Fin = 2,
 }
 
 #[repr(C, packed)]

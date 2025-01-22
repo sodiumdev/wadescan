@@ -19,7 +19,7 @@ use crate::{
     checksum, ping,
     ping::{PingParseError, RawLatest},
     sender::ResponseSender,
-    shared::{ServerInfo, SharedState},
+    shared::ServerInfo,
 };
 
 pub struct ConnectionState {
@@ -98,16 +98,16 @@ impl<'a> Responder<'a> {
             let seq = unsafe { (*hdr).seq };
             let ack = unsafe { (*hdr).ack };
 
-            trace!("received {ty:?} packet from {ip}:{port} with seq:{seq}/ack:{ack}");
-
             match ty {
                 PacketType::SynAck => {
                     let expected = checksum::cookie(&ip, port, self.seed) + 1;
                     if ack != expected {
-                        debug!("cookie mismatch for {ip}:{port} at SYN+ACK (expected {expected}, got {ack})");
+                        trace!("cookie mismatch for {ip}:{port} at SYN+ACK (expected {expected}, got {ack})");
 
                         continue;
                     }
+
+                    trace!("SYN+ACK from {ip}:{port}");
 
                     self.sender.send_ack(&ip, port, ack, seq + 1);
                     self.sender.send_psh(&ip, port, ack, seq + 1);
@@ -118,12 +118,12 @@ impl<'a> Responder<'a> {
 
                     let len = unsafe { ptr::read_unaligned(read.cast::<u16>()) };
                     if len == 0 {
-                        debug!("received ACK without data from {ip}:{port}");
+                        trace!("received ACK without data from {ip}:{port}");
 
                         continue;
                     }
 
-                    debug!("received ACK with {len} bytes from {ip}:{port}");
+                    trace!("received ACK with {len} bytes from {ip}:{port}");
 
                     let data = unsafe { from_raw_parts(read.add(size_of::<u16>()), len as usize) };
 
@@ -132,7 +132,7 @@ impl<'a> Responder<'a> {
                         self.connections.get_mut(&(ip, port))
                     {
                         if seq != conn.remote_seq {
-                            debug!("got wrong seq number! this is probably because of a retransmission");
+                            trace!("got wrong seq number! this is probably because of a retransmission");
 
                             self.sender.send_ack(&ip, port, ack, conn.remote_seq);
 
@@ -147,7 +147,7 @@ impl<'a> Responder<'a> {
                         let expected = checksum::cookie(&ip, port, self.seed)
                             .wrapping_add((self.ping_data.len() + 1) as u32);
                         if ack != expected {
-                            debug!("cookie mismatch for {ip}:{port} at ACK (expected {expected}, got {ack})");
+                            trace!("cookie mismatch for {ip}:{port} at ACK (expected {expected}, got {ack})");
 
                             continue;
                         }
@@ -194,11 +194,11 @@ impl<'a> Responder<'a> {
                         }
 
                         Err(PingParseError::Invalid) => {
-                            debug!("invalid response from {ip}:{port}");
+                            trace!("invalid response from {ip}:{port}");
                         }
 
                         Err(PingParseError::Incomplete) => {
-                            self.sender.send_ack(&ip, port, ack, remote_seq);
+                            self.sender.send_ack(&ip, port, ack, remote_seq)
                         }
                     }
                 }

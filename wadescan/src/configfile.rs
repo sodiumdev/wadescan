@@ -1,10 +1,10 @@
-use std::{fs, time::Duration};
+use std::{fs, num::NonZeroU32, time::Duration};
 
 use anyhow::Context;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_with::{serde_as, DurationSeconds};
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Deserialize)]
 pub struct Configfile {
     pub database: DatabaseConfig,
     pub ping: PingConfig,
@@ -14,14 +14,14 @@ pub struct Configfile {
     pub sender: SenderConfig,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Deserialize)]
 pub struct DatabaseConfig {
     pub url: String,
     pub name: String,
     pub collection_name: String,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Deserialize)]
 pub struct PingConfig {
     pub address: String,
     pub port: u16,
@@ -29,16 +29,22 @@ pub struct PingConfig {
 }
 
 #[serde_as]
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Deserialize)]
 pub struct ScannerConfig {
-    pub interface_name: String,
-
     #[serde_as(as = "DurationSeconds<u64>")]
-    pub tick_interval: Duration,
+    pub settling_delay: Duration,
+
+    pub target: ScannerTarget,
+}
+
+#[derive(Deserialize)]
+pub struct ScannerTarget {
+    pub pps: u64,
+    pub r#for: u64,
 }
 
 #[serde_as]
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Deserialize)]
 pub struct PurgerConfig {
     #[serde_as(as = "DurationSeconds<u64>")]
     pub interval: Duration,
@@ -48,17 +54,18 @@ pub struct PurgerConfig {
 }
 
 #[serde_as]
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Deserialize)]
 pub struct PrinterConfig {
     #[serde_as(as = "DurationSeconds<u64>")]
     pub interval: Duration,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Deserialize)]
 pub struct SenderConfig {
-    pub umem_size: u8,
-    pub complete_size: u8,
-    pub tx_size: u8,
+    pub interface_name: String,
+    pub umem_size: usize,
+    pub complete_size: u32,
+    pub tx_size: NonZeroU32,
 }
 
 #[inline]

@@ -18,7 +18,6 @@ use std::{
     alloc::{alloc, Layout},
     env,
     ffi::CString,
-    num::NonZeroU32,
     ptr::NonNull,
     sync::{atomic::AtomicUsize, Arc},
 };
@@ -85,11 +84,11 @@ async fn main() -> anyhow::Result<()> {
         .load()
         .expect("failed to load ebpf program to the kernel");
     program
-        .attach(&configfile.scanner.interface_name, XdpFlags::default())
+        .attach(&configfile.sender.interface_name, XdpFlags::default())
         .context("attaching program")
         .or_else(|_| {
             program
-                .attach(&configfile.scanner.interface_name, XdpFlags::SKB_MODE)
+                .attach(&configfile.sender.interface_name, XdpFlags::SKB_MODE)
                 .context("attaching program via skb")
         })?;
 
@@ -102,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
 
     let seed = rand::random();
 
-    let umem_size = 1 << configfile.sender.umem_size;
+    let umem_size = configfile.sender.umem_size;
     let layout = Layout::from_size_align(umem_size, 16384).context("validating layout")?;
     let ptr =
         NonNull::slice_from_raw_parts(unsafe { NonNull::new_unchecked(alloc(layout)) }, umem_size);
@@ -111,8 +110,8 @@ async fn main() -> anyhow::Result<()> {
         Umem::new(
             UmemConfig {
                 fill_size: 1, // 0 won't work for some reason
-                complete_size: 1 << configfile.sender.complete_size,
-                frame_size: FRAME_SIZE, // anything other than 1 << 12 won't work FOR SOME REASON
+                complete_size: configfile.sender.complete_size,
+                frame_size: FRAME_SIZE, // anything other than 1 << 12 won't work FOR SOME REASON, that's why it's hardcoded
                 headroom: 0,
                 flags: 0,
             },
@@ -124,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
     let mut iface = IfInfo::invalid();
     iface
         .from_name(
-            &CString::new(&*configfile.scanner.interface_name)
+            &CString::new(&*configfile.sender.interface_name)
                 .expect("error converting interface name to a cstr"),
         )
         .expect("failed to find interface");
@@ -135,13 +134,12 @@ async fn main() -> anyhow::Result<()> {
         .fq_cq(&sender_sock)
         .expect("failed to create device queue");
 
-    let tx_size = NonZeroU32::new(1 << configfile.sender.tx_size);
     let sender_rxtx = umem
         .rx_tx(
             &sender_sock,
             &SocketConfig {
                 rx_size: None,
-                tx_size,
+                tx_size: Some(configfile.sender.tx_size),
                 bind_flags: SocketConfig::XDP_BIND_ZEROCOPY | SocketConfig::XDP_BIND_NEED_WAKEUP,
             },
         )
@@ -156,7 +154,7 @@ async fn main() -> anyhow::Result<()> {
             &responder_sock,
             &SocketConfig {
                 rx_size: None,
-                tx_size,
+                tx_size: Some(configfile.sender.tx_size),
                 bind_flags: 0,
             },
         )
@@ -168,7 +166,7 @@ async fn main() -> anyhow::Result<()> {
 
     let iface = get_interfaces()
         .into_iter()
-        .find(|i| i.name == configfile.scanner.interface_name)
+        .find(|i| i.name == configfile.sender.interface_name)
         .unwrap();
     let source_ip = iface.ipv4.first().unwrap().addr;
 
@@ -259,7 +257,7 @@ async fn main() -> anyhow::Result<()> {
         excludefile,
         SynSender::new(tx, &gateway_mac, &interface_mac, source_ip, &umem),
         server_receiver,
-        configfile.scanner.tick_interval,
+        &configfile.scanner,
     );
 
     loop {

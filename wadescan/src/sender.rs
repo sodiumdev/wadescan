@@ -1,6 +1,6 @@
 use std::{hint, net::Ipv4Addr};
 
-use log::debug;
+use log::{debug, trace};
 use strength_reduce::StrengthReducedUsize;
 use xdpilone::{xdp::XdpDesc, BufIdx, RingTx, Umem};
 
@@ -71,6 +71,8 @@ unsafe impl Sync for Tx {}
 pub struct SynSender<'a> {
     frames: Vec<Frame<'a>>,
     packet: usize,
+    ppf: StrengthReducedUsize,
+    len: usize,
 
     source_ip: Ipv4Addr,
     tx: Tx,
@@ -86,6 +88,7 @@ impl SynSender<'_> {
         umem: &Umem,
     ) -> Self {
         let syn_len = SYN_PACKET.len();
+        let ppf = FRAME_SIZE as usize / syn_len;
 
         let frames = umem.len_frames().div_floor(2);
         let frames = (0..frames)
@@ -93,7 +96,7 @@ impl SynSender<'_> {
                 let mut frame = umem.frame(BufIdx(n)).unwrap();
                 let data = unsafe { frame.addr.as_mut() };
 
-                for packet in 0..64 {
+                for packet in 0..ppf {
                     let start = syn_len * packet;
 
                     data[start..start + syn_len].copy_from_slice(&SYN_PACKET[..]);
@@ -109,6 +112,8 @@ impl SynSender<'_> {
         Self {
             frames,
             packet: 0,
+            ppf: StrengthReducedUsize::new(ppf),
+            len: syn_len,
 
             source_ip,
             tx: Tx(tx),
@@ -119,7 +124,7 @@ impl SynSender<'_> {
     pub fn send_syn(&mut self, ip: &Ipv4Addr, port: u16, seed: u64) {
         self.packet += 1;
 
-        let mut frame = self.packet >> 6;
+        let mut frame = self.packet / self.ppf;
         if frame >= self.frames.len() {
             self.packet = 0;
             frame = 0;
@@ -128,10 +133,7 @@ impl SynSender<'_> {
         // SAFETY: bound checks are done above
         let (addr, frame) = unsafe { &mut *self.frames.as_mut_ptr().add(frame) };
 
-        let start = 62 * (self.packet % 63);
-        unsafe {
-            hint::assert_unchecked(frame.len() >= start + 58);
-        }
+        let start = self.len * (self.packet % self.ppf);
 
         frame[(start + 30)..(start + 34)].copy_from_slice(&ip.octets());
         frame[(start + 36)..(start + 38)].copy_from_slice(&port.to_be_bytes());
@@ -144,7 +146,11 @@ impl SynSender<'_> {
 
         // checksum is not skipped while calculating!!!
         {
-            let checksum = checksum::tcp(&frame[(start + 34)..(start + 62)], &self.source_ip, ip);
+            let checksum = checksum::tcp(
+                &frame[(start + 34)..(start + self.len)],
+                &self.source_ip,
+                ip,
+            );
 
             frame[(start + 50)..(start + 52)].copy_from_slice(&checksum.to_be_bytes());
         }
@@ -160,7 +166,7 @@ impl SynSender<'_> {
             let mut writer = self.tx.0.transmit(1);
             writer.insert_once(XdpDesc {
                 addr: *addr + start as u64,
-                len: 62,
+                len: self.len as u32,
                 options: 0,
             });
 
@@ -177,15 +183,17 @@ pub struct ResponseSender<'a> {
     ack_ppf: StrengthReducedUsize,
     ack_frames: Vec<Frame<'a>>,
     ack_packet: usize,
+    ack_len: usize,
 
     fin_ppf: StrengthReducedUsize,
     fin_frames: Vec<Frame<'a>>,
     fin_packet: usize,
+    fin_len: usize,
 
     psh_ppf: StrengthReducedUsize,
     psh_frames: Vec<Frame<'a>>,
     psh_packet: usize,
-    psh_len: u32,
+    psh_len: usize,
 
     source_ip: Ipv4Addr,
 
@@ -240,6 +248,7 @@ impl ResponseSender<'_> {
                 })
                 .collect(),
             ack_packet: 0,
+            ack_len: packet_len,
 
             fin_ppf: StrengthReducedUsize::new(packet_ppf),
             fin_frames: (ack_end..fin_end)
@@ -262,6 +271,7 @@ impl ResponseSender<'_> {
                 })
                 .collect(),
             fin_packet: 0,
+            fin_len: packet_len,
 
             psh_ppf: StrengthReducedUsize::new(psh_ppf),
             psh_frames: (fin_end..frames)
@@ -285,8 +295,7 @@ impl ResponseSender<'_> {
                 })
                 .collect(),
             psh_packet: 0,
-
-            psh_len: psh_len as u32,
+            psh_len: psh_len,
 
             source_ip,
 
@@ -296,6 +305,8 @@ impl ResponseSender<'_> {
 
     #[inline]
     pub fn send_ack(&mut self, ip: &Ipv4Addr, port: u16, seq: u32, ack: u32) {
+        trace!("sending ACK packet to {ip}:{port} with seq:{seq}/ack:{ack}");
+
         self.ack_packet += 1;
 
         let mut ack_frame = self.ack_packet / self.ack_ppf;
@@ -307,8 +318,7 @@ impl ResponseSender<'_> {
         // SAFETY: bound checks are done above
         let (addr, ack_frame) = unsafe { &mut *self.ack_frames.as_mut_ptr().add(ack_frame) };
 
-        let packet_len = OTHER_PACKET.len();
-        let start = packet_len * (self.ack_packet % self.ack_ppf);
+        let start = self.ack_len * (self.ack_packet % self.ack_ppf);
 
         ack_frame[(start + 30)..(start + 34)].copy_from_slice(&ip.octets());
         ack_frame[(start + 36)..(start + 38)].copy_from_slice(&port.to_be_bytes());
@@ -323,7 +333,7 @@ impl ResponseSender<'_> {
         // checksum is not skipped while calculating!!!
         {
             let checksum = checksum::tcp(
-                &ack_frame[(start + 34)..(start + packet_len)],
+                &ack_frame[(start + 34)..(start + self.ack_len)],
                 &self.source_ip,
                 ip,
             );
@@ -342,7 +352,7 @@ impl ResponseSender<'_> {
             let mut writer = self.tx.0.transmit(1);
             writer.insert_once(XdpDesc {
                 addr: *addr + start as u64,
-                len: packet_len as u32,
+                len: self.ack_len as u32,
                 options: 0,
             });
 
@@ -356,6 +366,8 @@ impl ResponseSender<'_> {
 
     #[inline]
     pub fn send_psh(&mut self, ip: &Ipv4Addr, port: u16, seq: u32, ack: u32) {
+        trace!("sending PSH packet to {ip}:{port} with seq:{seq}/ack:{ack}");
+
         self.psh_packet += 1;
 
         let mut psh_frame = self.psh_packet / self.psh_ppf;
@@ -367,7 +379,7 @@ impl ResponseSender<'_> {
         // SAFETY: bound checks are done above
         let (addr, psh_frame) = unsafe { &mut *self.psh_frames.as_mut_ptr().add(psh_frame) };
 
-        let start = self.psh_len as usize * (self.psh_packet % self.psh_ppf);
+        let start = self.psh_len * (self.psh_packet % self.psh_ppf);
 
         psh_frame[(start + 30)..(start + 34)].copy_from_slice(&ip.octets());
         psh_frame[(start + 36)..(start + 38)].copy_from_slice(&port.to_be_bytes());
@@ -381,7 +393,7 @@ impl ResponseSender<'_> {
         // checksum is not skipped while calculating!!!
         {
             let checksum = checksum::tcp(
-                &psh_frame[(start + 34)..(start + self.psh_len as usize)],
+                &psh_frame[(start + 34)..(start + self.psh_len)],
                 &self.source_ip,
                 ip,
             );
@@ -400,20 +412,18 @@ impl ResponseSender<'_> {
             let mut writer = self.tx.0.transmit(1);
             writer.insert_once(XdpDesc {
                 addr: *addr + start as u64,
-                len: self.psh_len,
+                len: self.psh_len as u32,
                 options: 0,
             });
 
             writer.commit();
         }
-
-        if self.tx.0.needs_wakeup() {
-            self.tx.0.wake();
-        }
     }
 
     #[inline]
     pub fn send_fin(&mut self, ip: &Ipv4Addr, port: u16, seq: u32, ack: u32) {
+        trace!("sending FIN packet to {ip}:{port} with seq:{seq}/ack:{ack}");
+
         self.fin_packet += 1;
 
         let mut fin_frame = self.fin_packet / self.fin_ppf;
@@ -425,8 +435,7 @@ impl ResponseSender<'_> {
         // SAFETY: bound checks are done above
         let (addr, fin_frame) = unsafe { &mut *self.fin_frames.as_mut_ptr().add(fin_frame) };
 
-        let packet_len = OTHER_PACKET.len();
-        let start = packet_len * (self.fin_packet % self.fin_ppf);
+        let start = self.fin_len * (self.fin_packet % self.fin_ppf);
 
         fin_frame[(start + 30)..(start + 34)].copy_from_slice(&ip.octets());
         fin_frame[(start + 36)..(start + 38)].copy_from_slice(&port.to_be_bytes());
@@ -440,7 +449,7 @@ impl ResponseSender<'_> {
         // checksum is not skipped while calculating!!!
         {
             let checksum = checksum::tcp(
-                &fin_frame[(start + 34)..(start + packet_len)],
+                &fin_frame[(start + 34)..(start + self.fin_len)],
                 &self.source_ip,
                 ip,
             );
@@ -459,15 +468,11 @@ impl ResponseSender<'_> {
             let mut writer = self.tx.0.transmit(1);
             writer.insert_once(XdpDesc {
                 addr: *addr + start as u64,
-                len: packet_len as u32,
+                len: self.fin_len as u32,
                 options: 0,
             });
 
             writer.commit();
-        }
-
-        if self.tx.0.needs_wakeup() {
-            self.tx.0.wake();
         }
     }
 }

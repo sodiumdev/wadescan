@@ -10,6 +10,3 @@ pub struct ServerInfo {
     pub port: u16,
     pub response: Response,
 }
-
-#[derive(Clone)]
-pub struct SharedState {}

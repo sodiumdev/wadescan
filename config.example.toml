@@ -10,28 +10,31 @@ collection_name = "servers"
 [ping]
 # server address/port for the SLP
 address = "wadescan"
-port = 3169
+port = 43169
 # protocol version
 protocol_version = 767
 
 # Scanner config
 [scanner]
-# The interface to scan over
-interface_name = "eth0"
-# The amount of time to wait after each scan, ideally same as the purger timeout
-tick_interval = 10
+# The amount of time to wait after each scan to settle down connections, ideally same as the purger timeout
+settling_delay = 10
+# The amount of packets to send every session
+target = { pps = 1_000_000, for = 60 }
 
 # Purger, this will drop stale connections
 [purger]
-interval = 60  # drop every X seconds
-timeout = 60   # drop stuff that's >X seconds old
+interval = 60  # drop every N seconds
+timeout = 60   # drop connections that are >N seconds old
 
 # Printer, will show occasional debug output
 [printer]
-interval = 5 
+interval = 5
 
-# Sender
+# Sender, this will calculate and send packets
 [sender]
-umem_size = 30
-complete_size = 26
-tx_size = 26
+# The interface to scan over
+interface_name = "eth0"
+# AF_XDP stuff, must be a power of two
+umem_size = 1_048_576
+complete_size = 65_536
+tx_size = 65_536

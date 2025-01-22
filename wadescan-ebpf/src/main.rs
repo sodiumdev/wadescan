@@ -164,5 +164,5 @@ fn output(ctx: &XdpContext, packet: PacketHeader, offset: usize, len: usize) -> 
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {}
+    unsafe { core::hint::unreachable_unchecked() }
 }
