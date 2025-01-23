@@ -9,7 +9,7 @@ pub enum PingParseError {
     Incomplete,
 }
 
-#[inline(always)]
+#[inline]
 pub fn build_latest_request(protocol_version: i32, hostname: &str, port: u16) -> Vec<u8> {
     let mut buffer = vec![0x00];
     write_varint(&mut buffer, protocol_version);
@@ -26,7 +26,7 @@ pub fn build_latest_request(protocol_version: i32, hostname: &str, port: u16) ->
     full_buffer
 }
 
-#[inline(always)]
+#[inline]
 fn write_varint(writer: &mut Vec<u8>, mut value: i32) {
     let mut buffer = [0];
     if value == 0 {
@@ -44,7 +44,7 @@ fn write_varint(writer: &mut Vec<u8>, mut value: i32) {
     }
 }
 
-#[inline(always)]
+#[inline]
 fn read_varint(ip: &mut usize, buffer: &[u8]) -> Option<i32> {
     let mut res = 0;
     for i in 0..5 {
@@ -60,7 +60,7 @@ fn read_varint(ip: &mut usize, buffer: &[u8]) -> Option<i32> {
     Some(res)
 }
 
-#[inline(always)]
+#[inline]
 pub fn parse_response(response: &[u8]) -> Result<Vec<u8>, PingParseError> {
     let mut ip = 0;
     for _ in 0..5 {

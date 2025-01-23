@@ -3,7 +3,6 @@
 ## Prerequisites
 
 1. up-to-date mainline kernel
-2. block your os from closing the connections: `sudo iptables -A INPUT -p tcp --dport 43169 -j DROP`
 2. stable rust toolchains: `rustup toolchain install stable`
 3. nightly rust toolchains: `rustup toolchain install nightly --component rust-src`
 4. (if cross-compiling) rustup target: `rustup target add ${ARCH}-unknown-linux-musl`
@@ -11,11 +10,16 @@
 6. (if cross-compiling) C toolchain: (e.g.) [`brew install filosottile/musl-cross/musl-cross`](https://github.com/FiloSottile/homebrew-musl-cross) (on macOS)
 7. bpf-linker: `cargo install bpf-linker` (`--no-default-features` on macOS)
 
-## Build & Run
+## Usage
 
-Use `cargo build`, `cargo check`, etc. as normal. Run your program with:
+Add a unique index for `ip+port` and a normal index for `found_at` in the collection where server responses are stored.
+Use `cargo build`, `cargo check`, etc. as normal. Run with:
 
 ```shell
+# Firewall port 43169 so your OS doesn't close the connections
+# Note: You probably want to use something like iptables-persistent to save this across reboots
+sudo iptables -A INPUT -p tcp --dport 43169 -j DROP
+
 cargo run --release --config 'target."cfg(all())".runner="sudo -E"'
 ```
 

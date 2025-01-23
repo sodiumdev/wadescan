@@ -43,6 +43,13 @@ pub struct ScannerTarget {
     pub r#for: u64,
 }
 
+impl From<ScannerTarget> for u64 {
+    #[inline(always)]
+    fn from(value: ScannerTarget) -> Self {
+        value.pps * value.r#for
+    }
+}
+
 #[serde_as]
 #[derive(Deserialize)]
 pub struct PurgerConfig {

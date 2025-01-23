@@ -295,7 +295,7 @@ impl ResponseSender<'_> {
                 })
                 .collect(),
             psh_packet: 0,
-            psh_len: psh_len,
+            psh_len,
 
             source_ip,
 

@@ -29,16 +29,18 @@ use aya::{
 };
 use dashmap::DashMap;
 use default_net::get_interfaces;
+use log::error;
 use mongodb::Client;
 use rustc_hash::FxBuildHasher;
 use xdpilone::{IfInfo, Socket, SocketConfig, Umem, UmemConfig};
 
 use crate::{
     completer::{PacketCompleter, Printer},
+    database::Database,
     responder::{Purger, Responder, TickResult},
     scanner::Scanner,
     sender::{ResponseSender, SynSender},
-    shared::FRAME_SIZE,
+    shared::{SharedData, FRAME_SIZE},
 };
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 6)]
@@ -182,7 +184,9 @@ async fn main() -> anyhow::Result<()> {
 
     let database = client.database(&configfile.database.name);
     let collection = database.collection(&configfile.database.collection_name);
-    let collection_responder = collection.clone();
+
+    let shared_data = SharedData::default();
+    let shared_data_scanner = shared_data.clone();
 
     let tx = responder_rxtx
         .map_tx()
@@ -197,8 +201,9 @@ async fn main() -> anyhow::Result<()> {
         &umem,
     );
 
-    let (server_sender, server_receiver) = flume::unbounded();
+    let (sender, receiver) = flume::unbounded();
 
+    let collection_responder = collection.clone();
     tokio::spawn(async move {
         let mut responder = Responder::new(
             collection_responder,
@@ -206,8 +211,9 @@ async fn main() -> anyhow::Result<()> {
             seed,
             ring_buf,
             response_sender,
-            server_sender,
+            sender,
             ping_data,
+            shared_data,
         )
         .expect("failed to initiate responder");
 
@@ -249,6 +255,17 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let collection_database = collection.clone();
+    tokio::spawn(async move {
+        let database = Database::new(collection_database, receiver);
+
+        loop {
+            if let Err(err) = database.tick().await {
+                error!("{}", err);
+            };
+        }
+    });
+
     // be ready to melt your fucking network!
     let tx = sender_rxtx.map_tx().expect("failed to map tx for scanner");
     let mut scanner = Scanner::new(
@@ -256,8 +273,8 @@ async fn main() -> anyhow::Result<()> {
         seed,
         excludefile,
         SynSender::new(tx, &gateway_mac, &interface_mac, source_ip, &umem),
-        server_receiver,
-        &configfile.scanner,
+        shared_data_scanner,
+        configfile.scanner.target.into(),
     );
 
     loop {

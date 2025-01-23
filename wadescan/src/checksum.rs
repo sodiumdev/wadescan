@@ -1,4 +1,4 @@
-use std::{net::Ipv4Addr, ptr};
+use std::{mem::transmute, net::Ipv4Addr, ptr};
 
 #[cfg(target_pointer_width = "64")]
 const K: usize = 0xf1357aea2e62a9c5;
@@ -7,7 +7,7 @@ const K: usize = 0x93d765dd;
 
 #[inline(always)]
 pub const fn cookie(ip: &Ipv4Addr, port: u16, seed: u64) -> u32 {
-    (u32::from_ne_bytes(ip.octets()) as usize)
+    (unsafe { transmute::<[u8; 4], u32>(ip.octets()) } as usize)
         .wrapping_mul(K)
         .wrapping_add(port as usize)
         .wrapping_mul(K)

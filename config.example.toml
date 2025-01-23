@@ -1,7 +1,9 @@
+# Copy the contents of this file into `config.toml`!
+
 # Database secrets, try to not share these everywhere
 [database]
 # mongo URL
-url = "mongodb://REPLACE-ME"
+url = "mongodb+srv://me:AZuvewcddcXtMqI2@cluster0.azof6.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 # mongoDB collection
 name = "mcscanner"
 collection_name = "servers"

@@ -1,31 +1,24 @@
-use std::{net::Ipv4Addr, time::Duration};
-
-use flume::Receiver;
-use log::{debug, info, trace};
+use log::info;
 use mongodb::{bson::Document, Collection};
 use perfect_rand::PerfectRng;
 
 use crate::{
-    configfile::ScannerConfig,
-    mode::{ModePicker, ScanMode},
+    mode,
     range::{Ipv4Ranges, StaticScanRanges},
     sender::SynSender,
-    shared::ServerInfo,
+    shared::SharedData,
 };
 
 pub struct Scanner<'a> {
+    shared_data: SharedData,
+
     seed: u64,
     excludes: Ipv4Ranges,
-
-    mode_picker: ModePicker,
-    mode: ScanMode,
 
     sender: SynSender<'a>,
 
     collection: Collection<Document>,
-    server_receiver: Receiver<ServerInfo>,
 
-    settling_delay: Duration,
     packet_count: u64,
 }
 
@@ -36,37 +29,33 @@ impl<'a> Scanner<'a> {
         seed: u64,
         excludes: Ipv4Ranges,
         sender: SynSender<'a>,
-        server_receiver: Receiver<ServerInfo>,
-        config: &ScannerConfig,
+        shared_data: SharedData,
+        packet_count: u64,
     ) -> Self {
-        let mode_picker = ModePicker::default();
-        let mode = mode_picker.pick();
-
         Self {
+            shared_data,
+
             seed,
             excludes,
-
-            mode_picker,
-            mode,
 
             sender,
 
             collection,
-            server_receiver,
 
-            settling_delay: config.settling_delay,
-            packet_count: config.target.pps * config.target.r#for,
+            packet_count,
         }
     }
 
     #[inline]
     pub async fn tick(&mut self) {
-        info!("scanning with mode {:?}", self.mode);
+        let mode = mode::pick(&self.collection);
+        info!("scanning with mode {:?}", mode);
 
         let ranges =
-            StaticScanRanges::from_excluding(self.mode.ranges(&self.collection), &self.excludes);
-
+            StaticScanRanges::from_excluding(mode.ranges(&self.collection), &self.excludes);
         let packet_count = u64::min(ranges.count as u64, self.packet_count);
+
+        self.shared_data.set_mode(mode);
 
         info!("spewing {packet_count} packets");
 
@@ -78,22 +67,6 @@ impl<'a> Scanner<'a> {
             self.sender.send_syn(&ip, port, self.seed);
         }
 
-        info!(
-            "finished spewing, waiting {} seconds to settle down connections",
-            self.settling_delay.as_secs()
-        );
-
-        tokio::time::sleep(self.settling_delay).await;
-
-        let found = self.server_receiver.len(); // TODO: store this to the database alongside the server info
-        info!("found {found} servers in this scan");
-
-        while let Ok(server_info) = self.server_receiver.try_recv() {
-            // all this mpsc channel stuff is to get the found servers from the receiver thread to the main (scanner) thread
-            // TODO: store the server info to the database from here and update the mode count (perhaps also store which mode the server was found in with all the info, we can aggregate that info later to find which mode with which port finds more servers)
-            debug!("{server_info:?}");
-        }
-
-        self.mode = self.mode_picker.pick();
+        info!("done spewing");
     }
 }

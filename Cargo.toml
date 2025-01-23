@@ -26,14 +26,18 @@ debug = 2
 opt-level = 3
 codegen-units = 1
 overflow-checks = false
+incremental = false
 
 [profile.release.package.wadescan]
 debug = 2
 opt-level = 3
 codegen-units = 1
 overflow-checks = false
+incremental = false
 
 [profile.release.package.wadescan-common]
 debug = 2
 opt-level = 3
 codegen-units = 1
+overflow-checks = false
+incremental = false

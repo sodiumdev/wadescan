@@ -9,8 +9,11 @@ use std::{
 use aya::maps::{MapData, RingBuf};
 use dashmap::DashMap;
 use flume::Sender;
-use log::{debug, info, trace};
-use mongodb::{bson::Document, Collection};
+use log::{debug, trace};
+use mongodb::{
+    bson::{DateTime, Document},
+    Collection,
+};
 use rustc_hash::FxBuildHasher;
 use tokio::io::unix::AsyncFd;
 use wadescan_common::{PacketHeader, PacketType};
@@ -19,7 +22,7 @@ use crate::{
     checksum, ping,
     ping::{PingParseError, RawLatest},
     sender::ResponseSender,
-    shared::ServerInfo,
+    shared::{ServerInfo, SharedData},
 };
 
 pub struct ConnectionState {
@@ -45,6 +48,8 @@ pub struct Responder<'a> {
 
     server_sender: Sender<ServerInfo>,
     ping_data: &'static [u8],
+
+    shared_data: SharedData,
 }
 
 #[repr(u8)]
@@ -63,6 +68,7 @@ impl<'a> Responder<'a> {
         sender: ResponseSender<'a>,
         server_sender: Sender<ServerInfo>,
         ping_data: &'static [u8],
+        shared_data: SharedData,
     ) -> Option<Self> {
         let fd = AsyncFd::new(ring_buf).ok()?;
 
@@ -77,6 +83,8 @@ impl<'a> Responder<'a> {
 
             server_sender,
             ping_data,
+
+            shared_data,
         })
     }
 
@@ -175,7 +183,7 @@ impl<'a> Responder<'a> {
 
                     match ping_response {
                         Ok(data) => {
-                            info!("found 1 ({ip}:{port})");
+                            debug!("found server at ({ip}:{port})");
 
                             if let Ok(mut raw) = serde_json::from_slice::<RawLatest>(&data) {
                                 raw.raw_json = data;
@@ -184,6 +192,8 @@ impl<'a> Responder<'a> {
                                     _ = self.server_sender.try_send(ServerInfo {
                                         ip,
                                         port,
+                                        found_at: DateTime::now(),
+                                        found_by: self.shared_data.get_mode().clone().unwrap(),
                                         response,
                                     });
                                 }
@@ -222,8 +232,6 @@ impl<'a> Responder<'a> {
                         self.sender.send_ack(&ip, port, ack, seq + 1);
                     }
                 }
-
-                _ => unreachable!(),
             };
         }
 

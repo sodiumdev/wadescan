@@ -74,9 +74,10 @@ pub struct ScanRanges {
 
 impl ScanRanges {
     #[inline]
-    pub fn from_excluding(ranges: Vec<ScanRange>, excludes: &Ipv4Ranges) -> Self {
-        let mut this = Self::default();
-        this.extend(ranges);
+    pub fn from_excluding(mut ranges: Vec<ScanRange>, excludes: &Ipv4Ranges) -> Self {
+        ranges.sort_by_key(|r| r.addr_start);
+
+        let mut this = Self { ranges };
         this.apply_exclude(excludes);
         this
     }

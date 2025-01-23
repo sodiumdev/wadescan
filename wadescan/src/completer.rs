@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use log::info;
 use xdpilone::DeviceQueue;
 
 pub struct PacketCompleter {
@@ -20,7 +21,7 @@ impl PacketCompleter {
 
     #[inline]
     pub fn tick(&mut self) {
-        let mut reader = self.device.complete(self.device.available());
+        let mut reader = self.device.complete(100);
         while reader.read().is_some() {
             self.completed.fetch_add(1, Ordering::Relaxed);
         }
@@ -55,11 +56,11 @@ impl Printer {
         let packets_per_second =
             (completed - self.completed_last) as f64 / self.last_print_time.elapsed().as_secs_f64();
         if packets_per_second > 10_000_000. {
-            println!("{} mpps", (packets_per_second / 1_000_000.).round() as u64)
+            info!("{} mpps", (packets_per_second / 1_000_000.).round() as u64)
         } else if packets_per_second > 10_000. {
-            println!("{} kpps", (packets_per_second / 1_000.).round() as u64)
+            info!("{} kpps", (packets_per_second / 1_000.).round() as u64)
         } else {
-            println!("{} pps", packets_per_second.round() as u64)
+            info!("{} pps", packets_per_second.round() as u64)
         };
 
         self.completed_last = completed;
