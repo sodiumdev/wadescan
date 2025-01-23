@@ -3,7 +3,7 @@
 # Database secrets, try to not share these everywhere
 [database]
 # mongo URL
-url = "mongodb+srv://me:AZuvewcddcXtMqI2@cluster0.azof6.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+url = "mongodb://REPLACE-ME"
 # mongoDB collection
 name = "mcscanner"
 collection_name = "servers"
