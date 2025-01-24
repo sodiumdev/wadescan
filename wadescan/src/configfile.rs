@@ -19,6 +19,7 @@ pub struct DatabaseConfig {
     pub url: String,
     pub name: String,
     pub collection_name: String,
+    pub threads: usize,
 }
 
 #[derive(Deserialize)]

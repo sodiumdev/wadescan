@@ -1,14 +1,17 @@
 // thanks mat
 
-use std::{net::Ipv4Addr, str::FromStr};
+use std::{collections::HashMap, net::Ipv4Addr, str::FromStr};
 
+use anyhow::{anyhow, bail, Context};
+use futures::TryStreamExt;
 use mongodb::{
-    bson::{Bson, Document},
+    bson::{doc, Bson, Document},
     Collection,
 };
+use rand::distributions::{Distribution, WeightedIndex};
 use serde::{Deserialize, Serialize};
 
-use crate::range::ScanRange;
+use crate::{range::ScanRange, shared::BsonExt};
 
 macro_rules! scan_mode {
     ($($variant:ident),*) => {
@@ -16,6 +19,11 @@ macro_rules! scan_mode {
         #[derive(Debug, Hash, Eq, PartialEq, Clone, Serialize, Deserialize)]
         pub enum ScanMode {
             $($variant),*
+        }
+
+        #[inline(always)]
+        const fn _count(_a: &str) -> usize {
+            1
         }
 
         impl ScanMode {
@@ -26,6 +34,10 @@ macro_rules! scan_mode {
                 }
             }
         }
+
+        static MODES: &[ScanMode] = &[
+            $(ScanMode::$variant),*
+        ];
 
         impl FromStr for ScanMode {
             type Err = ();
@@ -43,280 +55,398 @@ macro_rules! scan_mode {
 }
 
 scan_mode!(
+    Slash0,
     Slash0FewPorts,
     Slash0FilteredByAsn,
     Slash0SomeFilteredByAsn,
     Slash0FilteredBySlash24,
-    Slash0FilteredBySlash2430d,
-    Slash0FilteredBySlash24New,
     Slash0FilteredBySlash24Top128PortsUniform,
     Slash0FilteredBySlash24Top1024PortsUniform,
     Slash0FilteredBySlash24TopPortsWeighted,
-    Slash0,
-    Slash24SomePorts,
-    Slash24AllPortsNew,
-    Slash24AllPorts,
+    Slash16,
+    Slash16AllPorts,
+    Slash16RangePorts,
     Slash24,
-    Slash24FewPorts,
-    Slash24FewPortsNew,
-    Slash24New,
+    Slash24AllPorts,
+    Slash24RangePorts,
     Slash32AllPorts,
-    Slash32AllPorts365d,
-    Slash32AllPortsNew,
-    Slash32RangePorts,
-    Slash32RangePortsNew
+    Slash32RangePorts
 );
 
-impl Into<Bson> for ScanMode {
-    fn into(self) -> Bson {
-        Bson::String(self.name().to_string())
+impl From<ScanMode> for Bson {
+    fn from(value: ScanMode) -> Self {
+        Self::String(value.name().to_string())
     }
 }
 
 impl ScanMode {
     #[inline]
-    pub fn ranges(&self, collection: &Collection<Document>) -> Vec<ScanRange> {
+    pub async fn ranges(
+        &self,
+        collection: &Collection<Document>,
+    ) -> anyhow::Result<Vec<ScanRange>> {
         match self {
-            ScanMode::Slash0FewPorts => slash0_few_ports(collection),
-            ScanMode::Slash0FilteredByAsn => slash0_asn(collection),
-            ScanMode::Slash0SomeFilteredByAsn => slash0_some_asn(collection),
-            ScanMode::Slash0FilteredBySlash24 => slash0_slash24(collection),
-            ScanMode::Slash0FilteredBySlash2430d => slash0_slash24_30d(collection),
-            ScanMode::Slash0FilteredBySlash24New => slash0_slash24_new(collection),
+            ScanMode::Slash0FewPorts => slash0_few_ports(collection).await,
+            ScanMode::Slash0FilteredByAsn => slash0_asn(collection).await,
+            ScanMode::Slash0SomeFilteredByAsn => slash0_some_asn(collection).await,
+            ScanMode::Slash0FilteredBySlash24 => slash0_slash24(collection).await,
             ScanMode::Slash0FilteredBySlash24Top128PortsUniform => {
-                slash0_slash24_top128(collection)
+                slash0_slash24_top128(collection).await
             }
             ScanMode::Slash0FilteredBySlash24Top1024PortsUniform => {
-                slash0_slash24_top1024(collection)
+                slash0_slash24_top1024(collection).await
             }
             ScanMode::Slash0FilteredBySlash24TopPortsWeighted => {
-                slash0_slash24_top_weighted(collection)
+                slash0_slash24_top_weighted(collection).await
             }
             ScanMode::Slash0 => slash0(collection),
-            ScanMode::Slash24SomePorts => slash24_some_ports(collection),
-            ScanMode::Slash24AllPortsNew => slash24_all_ports_new(collection),
-            ScanMode::Slash24AllPorts => slash24_all_ports(collection),
-            ScanMode::Slash24 => slash24(collection),
-            ScanMode::Slash24FewPorts => slash24_few_ports(collection),
-            ScanMode::Slash24FewPortsNew => slash24_few_ports_new(collection),
-            ScanMode::Slash24New => slash24_new(collection),
-            ScanMode::Slash32AllPorts => slash32_all_ports(collection),
-            ScanMode::Slash32AllPorts365d => slash32_all_ports_365d(collection),
-            ScanMode::Slash32AllPortsNew => slash32_all_ports_new(collection),
-            ScanMode::Slash32RangePorts => slash32_range_ports(collection),
-            ScanMode::Slash32RangePortsNew => slash32_range_ports_new(collection),
+            ScanMode::Slash24AllPorts => slash24_all_ports(collection).await,
+            ScanMode::Slash24 => slash24(collection).await,
+            ScanMode::Slash24RangePorts => slash24_range(collection).await,
+            ScanMode::Slash16 => slash16(collection).await,
+            ScanMode::Slash16AllPorts => slash16_all_ports(collection).await,
+            ScanMode::Slash16RangePorts => slash16_range(collection).await,
+            ScanMode::Slash32AllPorts => slash32_all(collection).await,
+            ScanMode::Slash32RangePorts => slash32_range(collection).await,
         }
     }
 }
 
 #[inline(always)]
-fn slash0_few_ports(_collection: &Collection<Document>) -> Vec<ScanRange> {
-    vec![ScanRange::single_port(
-        Ipv4Addr::new(0, 0, 0, 0),
-        Ipv4Addr::new(255, 255, 255, 255),
-        25565,
-    )]
+async fn slash0_few_ports(collection: &Collection<Document>) -> anyhow::Result<Vec<ScanRange>> {
+    let mut cursor = collection
+        .aggregate([
+            doc! {
+                "$group": {
+                    "_id": "$port",
+                    "count": { "$sum": 1 }
+                }
+            },
+            doc! {
+                "$sort": {
+                    "_id": 1,
+                    "count": -1
+                }
+            },
+            doc! {
+                "$limit": 64
+            },
+        ])
+        .await
+        .context("aggregating data")?;
+
+    let mut ranges = Vec::new();
+    while let Some(doc) = cursor.try_next().await? {
+        ranges.push(ScanRange::single_port(
+            Ipv4Addr::new(0, 0, 0, 0),
+            Ipv4Addr::new(255, 255, 255, 255),
+            doc.get("_id").and_then(|r| r.as_i32()).unwrap() as u16,
+        ));
+    }
+
+    Ok(ranges)
 }
 
 #[inline(always)]
-fn slash0_asn(_collection: &Collection<Document>) -> Vec<ScanRange> {
-    vec![ScanRange::single_port(
-        Ipv4Addr::new(0, 0, 0, 0),
-        Ipv4Addr::new(255, 255, 255, 255),
-        25565,
-    )]
+async fn slash0_asn(_collection: &Collection<Document>) -> anyhow::Result<Vec<ScanRange>> {
+    bail!("unimplemented")
 }
 
 #[inline(always)]
-fn slash0_some_asn(_collection: &Collection<Document>) -> Vec<ScanRange> {
-    vec![ScanRange::single_port(
-        Ipv4Addr::new(0, 0, 0, 0),
-        Ipv4Addr::new(255, 255, 255, 255),
-        25565,
-    )]
+async fn slash0_some_asn(_collection: &Collection<Document>) -> anyhow::Result<Vec<ScanRange>> {
+    bail!("unimplemented")
 }
 
 #[inline(always)]
-fn slash0_slash24(_collection: &Collection<Document>) -> Vec<ScanRange> {
-    vec![ScanRange::single_port(
-        Ipv4Addr::new(0, 0, 0, 0),
-        Ipv4Addr::new(255, 255, 255, 255),
-        25565,
-    )]
+async fn slash0_slash24(_collection: &Collection<Document>) -> anyhow::Result<Vec<ScanRange>> {
+    bail!("unimplemented")
 }
 
 #[inline(always)]
-fn slash0_slash24_30d(_collection: &Collection<Document>) -> Vec<ScanRange> {
-    vec![ScanRange::single_port(
-        Ipv4Addr::new(0, 0, 0, 0),
-        Ipv4Addr::new(255, 255, 255, 255),
-        25565,
-    )]
+async fn slash0_slash24_top128(
+    _collection: &Collection<Document>,
+) -> anyhow::Result<Vec<ScanRange>> {
+    bail!("unimplemented")
 }
 
 #[inline(always)]
-fn slash0_slash24_new(_collection: &Collection<Document>) -> Vec<ScanRange> {
-    vec![ScanRange::single_port(
-        Ipv4Addr::new(0, 0, 0, 0),
-        Ipv4Addr::new(255, 255, 255, 255),
-        25565,
-    )]
+async fn slash0_slash24_top1024(
+    _collection: &Collection<Document>,
+) -> anyhow::Result<Vec<ScanRange>> {
+    bail!("unimplemented")
 }
 
 #[inline(always)]
-fn slash0_slash24_top128(_collection: &Collection<Document>) -> Vec<ScanRange> {
-    vec![ScanRange::single_port(
-        Ipv4Addr::new(0, 0, 0, 0),
-        Ipv4Addr::new(255, 255, 255, 255),
-        25565,
-    )]
+async fn slash0_ranges(_collection: &Collection<Document>) -> anyhow::Result<Vec<ScanRange>> {
+    bail!("unimplemented")
 }
 
 #[inline(always)]
-fn slash0_slash24_top1024(_collection: &Collection<Document>) -> Vec<ScanRange> {
-    vec![ScanRange::single_port(
-        Ipv4Addr::new(0, 0, 0, 0),
-        Ipv4Addr::new(255, 255, 255, 255),
-        25565,
-    )]
+async fn slash0_slash24_top_weighted(
+    _collection: &Collection<Document>,
+) -> anyhow::Result<Vec<ScanRange>> {
+    bail!("unimplemented")
 }
 
 #[inline(always)]
-fn slash0_ranges(_collection: &Collection<Document>) -> Vec<ScanRange> {
-    vec![ScanRange::single_port(
+fn slash0(_collection: &Collection<Document>) -> anyhow::Result<Vec<ScanRange>> {
+    Ok(vec![ScanRange::single_port(
         Ipv4Addr::new(0, 0, 0, 0),
         Ipv4Addr::new(255, 255, 255, 255),
         25565,
-    )]
+    )])
 }
 
 #[inline(always)]
-fn slash0_slash24_top_weighted(_collection: &Collection<Document>) -> Vec<ScanRange> {
-    vec![ScanRange::single_port(
-        Ipv4Addr::new(0, 0, 0, 0),
-        Ipv4Addr::new(255, 255, 255, 255),
-        25565,
-    )]
+async fn slash24_all_ports(collection: &Collection<Document>) -> anyhow::Result<Vec<ScanRange>> {
+    let mut cursor = collection
+        .aggregate([
+            doc! {
+                "$group": {
+                    "_id": { "$floor": { "$divide": ["$ip", 256] } },
+                }
+            },
+            doc! {
+                "$project": {
+                    "ip": "$_id"
+                }
+            },
+        ])
+        .await
+        .context("aggregating data")?;
+
+    let mut ranges = Vec::new();
+    while let Some(doc) = cursor.try_next().await? {
+        let ip24 = doc.get("ip").and_then(|r| r.as_int()).unwrap() as u32;
+        let ip24_a = ((ip24 >> 16) & 0xFF) as u8;
+        let ip24_b = ((ip24 >> 8) & 0xFF) as u8;
+        let ip24_c = (ip24 & 0xFF) as u8;
+
+        ranges.push(ScanRange {
+            addr_start: Ipv4Addr::new(ip24_a, ip24_b, ip24_c, 0),
+            addr_end: Ipv4Addr::new(ip24_a, ip24_b, ip24_c, 255),
+            port_start: 1024,
+            port_end: 65535,
+        });
+    }
+
+    Ok(ranges)
 }
 
 #[inline(always)]
-fn slash0(_collection: &Collection<Document>) -> Vec<ScanRange> {
-    vec![ScanRange::single_port(
-        Ipv4Addr::new(0, 0, 0, 0),
-        Ipv4Addr::new(255, 255, 255, 255),
-        25565,
-    )]
+async fn slash24_range(collection: &Collection<Document>) -> anyhow::Result<Vec<ScanRange>> {
+    let mut cursor = collection
+        .aggregate([
+            doc! {
+                "$group": {
+                    "_id": { "$floor": { "$divide": ["$ip", 256] } },
+                    "min_port": { "$min": "$port" },
+                    "max_port": { "$max": "$port" }
+                }
+            },
+            doc! {
+                "$project": {
+                    "_id": 0,
+                    "ip": "$_id",
+                    "min_port": 1,
+                    "max_port": 1,
+                }
+            },
+        ])
+        .await
+        .context("aggregating data")?;
+
+    let mut ranges = Vec::new();
+    while let Some(doc) = cursor.try_next().await? {
+        let ip24 = doc.get("ip").and_then(|r| r.as_int()).unwrap() as u32;
+        let ip24_a = ((ip24 >> 16) & 0xFF) as u8;
+        let ip24_b = ((ip24 >> 8) & 0xFF) as u8;
+        let ip24_c = (ip24 & 0xFF) as u8;
+
+        ranges.push(ScanRange {
+            addr_start: Ipv4Addr::new(ip24_a, ip24_b, ip24_c, 0),
+            addr_end: Ipv4Addr::new(ip24_a, ip24_b, ip24_c, 255),
+            port_start: doc.get("min_port").and_then(|val| val.as_int()).unwrap() as u16,
+            port_end: doc.get("max_port").and_then(|val| val.as_int()).unwrap() as u16,
+        });
+    }
+
+    Ok(ranges)
 }
 
 #[inline(always)]
-fn slash24_some_ports(_collection: &Collection<Document>) -> Vec<ScanRange> {
-    vec![ScanRange::single_port(
-        Ipv4Addr::new(0, 0, 0, 0),
-        Ipv4Addr::new(255, 255, 255, 255),
-        25565,
-    )]
+async fn slash24(collection: &Collection<Document>) -> anyhow::Result<Vec<ScanRange>> {
+    let mut cursor = collection
+        .aggregate([
+            doc! {
+                "$group": {
+                    "_id": { "$floor": { "$divide": ["$ip", 256] } },
+                    "top_ports": {
+                        "$push": "$port"
+                    }
+                }
+            },
+            doc! {
+                "$project": {
+                    "_id": 0,
+                    "ip": "$_id",
+                    "top_ports": { "$slice": ["$top_ports", 64] }
+                }
+            },
+        ])
+        .await
+        .context("aggregating data")?;
+
+    let mut ranges = Vec::new();
+    while let Some(doc) = cursor.try_next().await? {
+        let ip24 = doc.get("ip").and_then(|r| r.as_int()).unwrap() as u32;
+        let ip24_a = ((ip24 >> 16) & 0xFF) as u8;
+        let ip24_b = ((ip24 >> 8) & 0xFF) as u8;
+        let ip24_c = (ip24 & 0xFF) as u8;
+
+        for port in doc.get_array("top_ports")? {
+            ranges.push(ScanRange::single_port(
+                Ipv4Addr::new(ip24_a, ip24_b, ip24_c, 0),
+                Ipv4Addr::new(ip24_a, ip24_b, ip24_c, 255),
+                port.as_int().ok_or(anyhow!("port not int somehow"))? as u16,
+            ));
+        }
+    }
+
+    Ok(ranges)
 }
 
 #[inline(always)]
-fn slash24_all_ports_new(_collection: &Collection<Document>) -> Vec<ScanRange> {
-    vec![ScanRange::single_port(
-        Ipv4Addr::new(0, 0, 0, 0),
-        Ipv4Addr::new(255, 255, 255, 255),
-        25565,
-    )]
+async fn slash16(collection: &Collection<Document>) -> anyhow::Result<Vec<ScanRange>> {
+    let mut cursor = collection
+        .aggregate([
+            doc! {
+                "$group": {
+                    "_id": { "$floor": { "$divide": ["$ip", 65536] } },
+                    "top_ports": {
+                        "$push": "$port"
+                    }
+                }
+            },
+            doc! {
+                "$project": {
+                    "_id": 0,
+                    "ip": "$_id",
+                    "top_ports": { "$slice": ["$top_ports", 64] }
+                }
+            },
+        ])
+        .await
+        .context("aggregating data")?;
+
+    let mut ranges = Vec::new();
+    while let Some(doc) = cursor.try_next().await? {
+        let ip24 = doc.get("ip").and_then(|r| r.as_int()).unwrap() as u32;
+        let ip24_a = ((ip24 >> 8) & 0xFF) as u8;
+        let ip24_b = (ip24 & 0xFF) as u8;
+
+        for port in doc.get_array("top_ports")? {
+            ranges.push(ScanRange::single_port(
+                Ipv4Addr::new(ip24_a, ip24_b, 0, 0),
+                Ipv4Addr::new(ip24_a, ip24_b, 255, 255),
+                port.as_int().ok_or(anyhow!("port not int somehow"))? as u16,
+            ));
+        }
+    }
+
+    Ok(ranges)
 }
 
 #[inline(always)]
-fn slash24_all_ports(_collection: &Collection<Document>) -> Vec<ScanRange> {
-    vec![ScanRange::single_port(
-        Ipv4Addr::new(0, 0, 0, 0),
-        Ipv4Addr::new(255, 255, 255, 255),
-        25565,
-    )]
+async fn slash16_all_ports(collection: &Collection<Document>) -> anyhow::Result<Vec<ScanRange>> {
+    let mut cursor = collection
+        .aggregate([
+            doc! {
+                "$group": {
+                    "_id": { "$floor": { "$divide": ["$ip", 65536] } },
+                }
+            },
+            doc! {
+                "$project": {
+                    "ip": "$_id"
+                }
+            },
+        ])
+        .await
+        .context("aggregating data")?;
+
+    let mut ranges = Vec::new();
+    while let Some(doc) = cursor.try_next().await? {
+        let ip24 = doc.get("ip").and_then(|r| r.as_int()).unwrap() as u32;
+        let ip24_a = ((ip24 >> 8) & 0xFF) as u8;
+        let ip24_b = (ip24 & 0xFF) as u8;
+
+        ranges.push(ScanRange {
+            addr_start: Ipv4Addr::new(ip24_a, ip24_b, 0, 0),
+            addr_end: Ipv4Addr::new(ip24_a, ip24_b, 255, 255),
+            port_start: 1024,
+            port_end: 65535,
+        });
+    }
+
+    Ok(ranges)
 }
 
 #[inline(always)]
-fn slash24(_collection: &Collection<Document>) -> Vec<ScanRange> {
-    vec![ScanRange::single_port(
-        Ipv4Addr::new(0, 0, 0, 0),
-        Ipv4Addr::new(255, 255, 255, 255),
-        25565,
-    )]
+async fn slash16_range(_collection: &Collection<Document>) -> anyhow::Result<Vec<ScanRange>> {
+    bail!("unimplemented")
 }
 
 #[inline(always)]
-fn slash24_few_ports(_collection: &Collection<Document>) -> Vec<ScanRange> {
-    vec![ScanRange::single_port(
-        Ipv4Addr::new(0, 0, 0, 0),
-        Ipv4Addr::new(255, 255, 255, 255),
-        25565,
-    )]
+async fn slash32_range(_collection: &Collection<Document>) -> anyhow::Result<Vec<ScanRange>> {
+    bail!("unimplemented")
 }
 
 #[inline(always)]
-fn slash24_few_ports_new(_collection: &Collection<Document>) -> Vec<ScanRange> {
-    vec![ScanRange::single_port(
-        Ipv4Addr::new(0, 0, 0, 0),
-        Ipv4Addr::new(255, 255, 255, 255),
-        25565,
-    )]
+async fn slash32_all(_collection: &Collection<Document>) -> anyhow::Result<Vec<ScanRange>> {
+    bail!("unimplemented")
 }
 
-#[inline(always)]
-fn slash24_new(_collection: &Collection<Document>) -> Vec<ScanRange> {
-    vec![ScanRange::single_port(
-        Ipv4Addr::new(0, 0, 0, 0),
-        Ipv4Addr::new(255, 255, 255, 255),
-        25565,
-    )]
-}
+pub async fn pick(collection: &Collection<Document>) -> anyhow::Result<ScanMode> {
+    let mut cursor = collection
+        .aggregate([doc! {
+            "$group": {
+                "_id": "$found_by",
+                "count": { "$sum": 1 }
+            }
+        }])
+        .await
+        .context("aggregating data")?;
 
-#[inline(always)]
-fn slash32_all_ports(_collection: &Collection<Document>) -> Vec<ScanRange> {
-    vec![ScanRange::single_port(
-        Ipv4Addr::new(0, 0, 0, 0),
-        Ipv4Addr::new(255, 255, 255, 255),
-        25565,
-    )]
-}
+    let mut modes = HashMap::new();
+    for mode in MODES {
+        modes.insert(mode.clone(), 0);
+    }
 
-#[inline(always)]
-fn slash32_all_ports_365d(_collection: &Collection<Document>) -> Vec<ScanRange> {
-    vec![ScanRange::single_port(
-        Ipv4Addr::new(0, 0, 0, 0),
-        Ipv4Addr::new(255, 255, 255, 255),
-        25565,
-    )]
-}
+    while let Some(document) = cursor.try_next().await? {
+        let mode =
+            ScanMode::from_str(document.get_str("_id")?).map_err(|_| anyhow!("invalid mode"))?;
+        let count = match document.get("count") {
+            Some(&Bson::Int32(i)) => i as i64,
+            Some(&Bson::Int64(i)) => i,
+            _ => bail!("invalid count"),
+        };
 
-#[inline(always)]
-fn slash32_all_ports_new(_collection: &Collection<Document>) -> Vec<ScanRange> {
-    vec![ScanRange::single_port(
-        Ipv4Addr::new(0, 0, 0, 0),
-        Ipv4Addr::new(255, 255, 255, 255),
-        25565,
-    )]
-}
+        modes.insert(mode, count);
+    }
 
-#[inline(always)]
-fn slash32_range_ports(_collection: &Collection<Document>) -> Vec<ScanRange> {
-    vec![ScanRange::single_port(
-        Ipv4Addr::new(0, 0, 0, 0),
-        Ipv4Addr::new(255, 255, 255, 255),
-        25565,
-    )]
-}
+    if modes.values().all(|&count| count == 0) {
+        return Ok(ScanMode::Slash0);
+    }
 
-#[inline(always)]
-fn slash32_range_ports_new(_collection: &Collection<Document>) -> Vec<ScanRange> {
-    vec![ScanRange::single_port(
-        Ipv4Addr::new(0, 0, 0, 0),
-        Ipv4Addr::new(255, 255, 255, 255),
-        25565,
-    )]
-}
+    let mut modes = modes.into_iter().collect::<Vec<_>>();
+    let dist = WeightedIndex::new(
+        modes
+            .iter()
+            .map(|(_, count)| (count * count) + 1)
+            .collect::<Vec<_>>(),
+    )
+    .context("creating weighted index")?;
 
-#[inline]
-pub fn pick(collection: &Collection<Document>) -> ScanMode {
-    ScanMode::Slash0
+    Ok(modes.swap_remove(dist.sample(&mut rand::thread_rng())).0)
 }

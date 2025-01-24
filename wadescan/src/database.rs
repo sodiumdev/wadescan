@@ -1,6 +1,6 @@
 use anyhow::{bail, Context};
 use flume::Receiver;
-use log::debug;
+use log::{debug, error, info};
 use mongodb::{bson::Document, Collection};
 
 use crate::shared::ServerInfo;
@@ -28,12 +28,14 @@ impl Database {
         let ip = server_info.ip;
         let port = server_info.port;
 
-        self.collection
-            .insert_one(Document::from(server_info))
+        match self
+            .collection
+            .insert_one(server_info.into_document())
             .await
-            .context("failed to store response in database")?;
-
-        debug!("inserting {}:{} into database", ip, port);
+        {
+            Ok(_) => info!("inserted {}:{} into database", ip, port),
+            Err(err) => error!("error while inserting into database: {}", err),
+        }
 
         Ok(())
     }

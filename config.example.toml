@@ -7,6 +7,8 @@ url = "mongodb://REPLACE-ME"
 # mongoDB collection
 name = "mcscanner"
 collection_name = "servers"
+# the amount of threads that are writing to the database
+threads = 4
 
 # SLP scanner
 [ping]

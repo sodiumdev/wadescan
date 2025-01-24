@@ -47,12 +47,12 @@ impl<'a> Scanner<'a> {
     }
 
     #[inline]
-    pub async fn tick(&mut self) {
-        let mode = mode::pick(&self.collection);
+    pub async fn tick(&mut self) -> anyhow::Result<()> {
+        let mode = mode::pick(&self.collection).await?;
         info!("scanning with mode {:?}", mode);
 
         let ranges =
-            StaticScanRanges::from_excluding(mode.ranges(&self.collection), &self.excludes);
+            StaticScanRanges::from_excluding(mode.ranges(&self.collection).await?, &self.excludes);
         let packet_count = u64::min(ranges.count as u64, self.packet_count);
 
         self.shared_data.set_mode(mode);
@@ -68,5 +68,7 @@ impl<'a> Scanner<'a> {
         }
 
         info!("done spewing");
+
+        Ok(())
     }
 }

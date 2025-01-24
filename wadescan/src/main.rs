@@ -43,7 +43,7 @@ use crate::{
     shared::{SharedData, FRAME_SIZE},
 };
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 6)]
+#[tokio::main(flavor = "multi_thread", worker_threads = 16)]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
 
@@ -255,16 +255,19 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let collection_database = collection.clone();
-    tokio::spawn(async move {
-        let database = Database::new(collection_database, receiver);
+    for _ in 0..configfile.database.threads {
+        let receiver = receiver.clone();
+        let collection = collection.clone();
+        tokio::spawn(async move {
+            let database = Database::new(collection, receiver);
 
-        loop {
-            if let Err(err) = database.tick().await {
-                error!("{}", err);
-            };
-        }
-    });
+            loop {
+                if let Err(err) = database.tick().await {
+                    error!("Error at database: {}", err);
+                };
+            }
+        });
+    }
 
     // be ready to melt your fucking network!
     let tx = sender_rxtx.map_tx().expect("failed to map tx for scanner");
@@ -278,6 +281,8 @@ async fn main() -> anyhow::Result<()> {
     );
 
     loop {
-        scanner.tick().await;
+        if let Err(err) = scanner.tick().await {
+            error!("Error at scanner: {}", err);
+        };
     }
 }

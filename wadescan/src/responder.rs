@@ -264,7 +264,7 @@ impl Purger {
     #[inline]
     pub async fn tick(&self) {
         self.connections
-            .retain(|_, conn| conn.started.elapsed() <= self.ping_timeout);
+            .retain(|_, conn| conn.started.elapsed() < self.ping_timeout);
 
         tokio::time::sleep(self.purge_interval).await;
     }

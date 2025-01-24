@@ -2,7 +2,7 @@ use std::{cell::UnsafeCell, net::Ipv4Addr, ops::Deref, sync::Arc};
 
 use mongodb::{
     bson,
-    bson::{doc, DateTime, Document},
+    bson::{doc, Bson, DateTime, Document},
 };
 
 use crate::{mode::ScanMode, ping::Response};
@@ -18,14 +18,14 @@ pub struct ServerInfo {
     pub response: Response,
 }
 
-impl From<ServerInfo> for Document {
-    fn from(value: ServerInfo) -> Self {
+impl ServerInfo {
+    pub fn into_document(self) -> Document {
         doc! {
-            "ip": value.ip.to_bits(),
-            "port": value.port as u32,
-            "found_at": value.found_at,
-            "found_by": value.found_by,
-            "response": bson::to_bson(&value.response).unwrap()
+            "ip": self.ip.to_bits() as i64,
+            "port": self.port as i32,
+            "found_at": self.found_at,
+            "found_by": self.found_by,
+            "response": bson::to_bson(&self.response).unwrap()
         }
     }
 }
@@ -63,5 +63,20 @@ impl InnerSharedData {
     #[inline(always)]
     pub fn set_mode(&self, mode: ScanMode) {
         unsafe { *self.mode.get() = Some(mode) }
+    }
+}
+
+pub trait BsonExt {
+    fn as_int(&self) -> Option<i64>;
+}
+
+impl BsonExt for Bson {
+    #[inline]
+    fn as_int(&self) -> Option<i64> {
+        match *self {
+            Bson::Int32(i) => Some(i as i64),
+            Bson::Int64(i) => Some(i),
+            _ => None,
+        }
     }
 }
