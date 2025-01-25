@@ -1,18 +1,21 @@
-use anyhow::{bail, Context};
+use anyhow::bail;
 use flume::Receiver;
 use log::{debug, error, info};
-use mongodb::{bson::Document, Collection};
+use mongodb::{
+    Collection,
+    bson::{Document, doc},
+};
 
 use crate::shared::ServerInfo;
 
-pub struct Database {
+pub struct Processor {
     collection: Collection<Document>,
     receiver: Receiver<ServerInfo>,
 }
 
-impl Database {
+impl Processor {
     #[inline]
-    pub fn new(collection: Collection<Document>, receiver: Receiver<ServerInfo>) -> Database {
+    pub fn new(collection: Collection<Document>, receiver: Receiver<ServerInfo>) -> Processor {
         Self {
             collection,
             receiver,
@@ -28,9 +31,23 @@ impl Database {
         let ip = server_info.ip;
         let port = server_info.port;
 
+        debug!("trying to insert {}:{}", ip, port);
+
         match self
             .collection
-            .insert_one(server_info.into_document())
+            .update_one(
+                doc! { "ip": ip.to_bits() as i64, "port": port as i32 },
+                doc! {
+                    "$push": {
+                        "pings": {
+                            "at": server_info.found_at,
+                            "by": server_info.found_by,
+                            "response": server_info.response
+                        }
+                    }
+                },
+            )
+            .upsert(true)
             .await
         {
             Ok(_) => info!("inserted {}:{} into database", ip, port),

@@ -1,13 +1,14 @@
 #![feature(const_vec_string_slice, variant_count)]
+#![feature(generic_arg_infer)]
 #![feature(int_roundings)]
 
 pub mod checksum;
 pub mod completer;
 pub mod configfile;
-pub mod database;
 pub mod excludefile;
 pub mod mode;
 pub mod ping;
+pub mod processor;
 pub mod range;
 pub mod responder;
 pub mod scanner;
@@ -15,11 +16,11 @@ pub mod sender;
 mod shared;
 
 use std::{
-    alloc::{alloc, Layout},
+    alloc::{Layout, alloc},
     env,
     ffi::CString,
     ptr::NonNull,
-    sync::{atomic::AtomicUsize, Arc},
+    sync::{Arc, atomic::AtomicUsize},
 };
 
 use anyhow::Context;
@@ -31,16 +32,17 @@ use dashmap::DashMap;
 use default_net::get_interfaces;
 use log::error;
 use mongodb::Client;
+use rand::Rng;
 use rustc_hash::FxBuildHasher;
 use xdpilone::{IfInfo, Socket, SocketConfig, Umem, UmemConfig};
 
 use crate::{
     completer::{PacketCompleter, Printer},
-    database::Database,
+    processor::Processor,
     responder::{Purger, Responder, TickResult},
     scanner::Scanner,
     sender::{ResponseSender, SynSender},
-    shared::{SharedData, FRAME_SIZE},
+    shared::{FRAME_SIZE, SharedData},
 };
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 16)]
@@ -50,13 +52,10 @@ async fn main() -> anyhow::Result<()> {
     unsafe {
         // set resource limit to infinity
         // oom go brr
-        libc::setrlimit(
-            libc::RLIMIT_MEMLOCK,
-            &libc::rlimit {
-                rlim_cur: libc::RLIM_INFINITY,
-                rlim_max: libc::RLIM_INFINITY,
-            },
-        )
+        libc::setrlimit(libc::RLIMIT_MEMLOCK, &libc::rlimit {
+            rlim_cur: libc::RLIM_INFINITY,
+            rlim_max: libc::RLIM_INFINITY,
+        })
     };
 
     let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
@@ -137,14 +136,11 @@ async fn main() -> anyhow::Result<()> {
         .expect("failed to create device queue");
 
     let sender_rxtx = umem
-        .rx_tx(
-            &sender_sock,
-            &SocketConfig {
-                rx_size: None,
-                tx_size: Some(configfile.sender.tx_size),
-                bind_flags: SocketConfig::XDP_BIND_ZEROCOPY | SocketConfig::XDP_BIND_NEED_WAKEUP,
-            },
-        )
+        .rx_tx(&sender_sock, &SocketConfig {
+            rx_size: None,
+            tx_size: Some(configfile.sender.tx_size),
+            bind_flags: SocketConfig::XDP_BIND_ZEROCOPY | SocketConfig::XDP_BIND_NEED_WAKEUP,
+        })
         .expect("failed to map rxtx for sender");
 
     umem.bind(&sender_rxtx)
@@ -152,14 +148,11 @@ async fn main() -> anyhow::Result<()> {
 
     let responder_sock = Socket::new(&iface).expect("failed to create socket for responder");
     let responder_rxtx = umem
-        .rx_tx(
-            &responder_sock,
-            &SocketConfig {
-                rx_size: None,
-                tx_size: Some(configfile.sender.tx_size),
-                bind_flags: 0,
-            },
-        )
+        .rx_tx(&responder_sock, &SocketConfig {
+            rx_size: None,
+            tx_size: Some(configfile.sender.tx_size),
+            bind_flags: 0,
+        })
         .expect("failed to map rxtx for responder");
 
     device
@@ -183,7 +176,8 @@ async fn main() -> anyhow::Result<()> {
         .expect("failed to initiate database connection");
 
     let database = client.database(&configfile.database.name);
-    let collection = database.collection(&configfile.database.collection_name);
+    let modes_collection = database.collection(&configfile.database.modes_collection);
+    let servers_collection = database.collection(&configfile.database.servers_collection);
 
     let shared_data = SharedData::default();
     let shared_data_scanner = shared_data.clone();
@@ -202,11 +196,8 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let (sender, receiver) = flume::unbounded();
-
-    let collection_responder = collection.clone();
     tokio::spawn(async move {
         let mut responder = Responder::new(
-            collection_responder,
             connections,
             seed,
             ring_buf,
@@ -255,29 +246,32 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    for _ in 0..configfile.database.threads {
-        let receiver = receiver.clone();
-        let collection = collection.clone();
-        tokio::spawn(async move {
-            let database = Database::new(collection, receiver);
-
-            loop {
-                if let Err(err) = database.tick().await {
-                    error!("Error at database: {}", err);
-                };
-            }
-        });
-    }
+    // tokio::spawn(async move {
+    //     let database = Processor::new(collection, receiver);
+    //
+    //     loop {
+    //         if let Err(err) = database.tick().await {
+    //             error!("Error at database: {}", err);
+    //         };
+    //     }
+    // });
 
     // be ready to melt your fucking network!
     let tx = sender_rxtx.map_tx().expect("failed to map tx for scanner");
+    let syn_sender = SynSender::new(tx, &gateway_mac, &interface_mac, source_ip, &umem);
+
+    // this is the part that actually scans and adapts
     let mut scanner = Scanner::new(
-        collection,
+        servers_collection,
+        modes_collection,
         seed,
         excludefile,
-        SynSender::new(tx, &gateway_mac, &interface_mac, source_ip, &umem),
+        syn_sender,
         shared_data_scanner,
+        configfile.scanner.settling_delay,
+        receiver,
         configfile.scanner.target.into(),
+        configfile.scanner.confidence,
     );
 
     loop {

@@ -60,15 +60,15 @@ fn try_receive(ctx: XdpContext) -> Result<u32, ()> {
 
     let (ip, port) = unsafe {
         (
-            u32::from_be((*ip_hdr).src_addr),
-            u16::from_be((*tcp_hdr).source),
+            u32::from_be((&*ip_hdr).src_addr),
+            u16::from_be((&*tcp_hdr).source),
         )
     };
 
     let (seq, ack) = unsafe {
         (
-            u32::from_be((*tcp_hdr).seq),
-            u32::from_be((*tcp_hdr).ack_seq),
+            u32::from_be((&*tcp_hdr).seq),
+            u32::from_be((&*tcp_hdr).ack_seq),
         )
     };
 
@@ -76,12 +76,12 @@ fn try_receive(ctx: XdpContext) -> Result<u32, ()> {
         &ctx,
         PacketHeader {
             ty: {
-                if unsafe { (*tcp_hdr).rst() } != 0 {
+                if unsafe { (&*tcp_hdr).rst() } != 0 {
                     return Ok(XDP_PASS);
-                } else if unsafe { (*tcp_hdr).fin() } != 0 {
+                } else if unsafe { (&*tcp_hdr).fin() } != 0 {
                     PacketType::Fin
-                } else if unsafe { (*tcp_hdr).ack() } != 0 {
-                    if unsafe { (*tcp_hdr).syn() } != 0 {
+                } else if unsafe { (&*tcp_hdr).ack() } != 0 {
+                    if unsafe { (&*tcp_hdr).syn() } != 0 {
                         PacketType::SynAck
                     } else {
                         PacketType::Ack
@@ -102,8 +102,8 @@ fn try_receive(ctx: XdpContext) -> Result<u32, ()> {
 
 #[inline(always)]
 const unsafe fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
-    let start = (*ctx.ctx).data as usize;
-    let end = (*ctx.ctx).data_end as usize;
+    let start = unsafe { &*ctx.ctx }.data as usize;
+    let end = unsafe { &*ctx.ctx }.data_end as usize;
     let len = size_of::<T>();
 
     let addr = start + offset;

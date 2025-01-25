@@ -2,14 +2,14 @@
 
 use std::{collections::HashMap, net::Ipv4Addr, str::FromStr};
 
-use anyhow::{anyhow, bail, Context};
+use anyhow::{Context, anyhow, bail};
 use futures::TryStreamExt;
 use mongodb::{
-    bson::{doc, Bson, Document},
     Collection,
+    bson::{Bson, Document, doc},
 };
-use rand::distributions::{Distribution, WeightedIndex};
 use serde::{Deserialize, Serialize};
+use statrs::distribution::{Beta, ContinuousCDF};
 
 use crate::{range::ScanRange, shared::BsonExt};
 
@@ -200,24 +200,17 @@ fn slash0(_collection: &Collection<Document>) -> anyhow::Result<Vec<ScanRange>> 
 #[inline(always)]
 async fn slash24_all_ports(collection: &Collection<Document>) -> anyhow::Result<Vec<ScanRange>> {
     let mut cursor = collection
-        .aggregate([
-            doc! {
-                "$group": {
-                    "_id": { "$floor": { "$divide": ["$ip", 256] } },
-                }
-            },
-            doc! {
-                "$project": {
-                    "ip": "$_id"
-                }
-            },
-        ])
+        .aggregate([doc! {
+            "$group": {
+                "_id": { "$floor": { "$divide": ["$ip", 256] } },
+            }
+        }])
         .await
         .context("aggregating data")?;
 
     let mut ranges = Vec::new();
     while let Some(doc) = cursor.try_next().await? {
-        let ip24 = doc.get("ip").and_then(|r| r.as_int()).unwrap() as u32;
+        let ip24 = doc.get("_id").and_then(|r| r.as_int()).unwrap() as u32;
         let ip24_a = ((ip24 >> 16) & 0xFF) as u8;
         let ip24_b = ((ip24 >> 8) & 0xFF) as u8;
         let ip24_c = (ip24 & 0xFF) as u8;
@@ -368,6 +361,7 @@ async fn slash16_all_ports(collection: &Collection<Document>) -> anyhow::Result<
             },
             doc! {
                 "$project": {
+                    "_id": 0,
                     "ip": "$_id"
                 }
             },
@@ -407,46 +401,49 @@ async fn slash32_all(_collection: &Collection<Document>) -> anyhow::Result<Vec<S
     bail!("unimplemented")
 }
 
-pub async fn pick(collection: &Collection<Document>) -> anyhow::Result<ScanMode> {
-    let mut cursor = collection
-        .aggregate([doc! {
-            "$group": {
-                "_id": "$found_by",
-                "count": { "$sum": 1 }
-            }
-        }])
-        .await
-        .context("aggregating data")?;
+pub async fn pick(confidence: f64, collection: &Collection<Document>) -> anyhow::Result<ScanMode> {
+    let mut cursor = collection.find(doc! {}).await.context("aggregating data")?;
 
     let mut modes = HashMap::new();
     for mode in MODES {
-        modes.insert(mode.clone(), 0);
+        modes.insert(mode.clone(), (1, 1));
     }
 
     while let Some(document) = cursor.try_next().await? {
-        let mode =
-            ScanMode::from_str(document.get_str("_id")?).map_err(|_| anyhow!("invalid mode"))?;
-        let count = match document.get("count") {
-            Some(&Bson::Int32(i)) => i as i64,
-            Some(&Bson::Int64(i)) => i,
-            _ => bail!("invalid count"),
+        let Ok(mode) = ScanMode::from_str(document.get_str("mode")?) else {
+            continue;
+        };
+        let Some(alpha) = document.get("alpha").and_then(|r| r.as_int()) else {
+            continue;
+        };
+        let Some(beta) = document.get("beta").and_then(|r| r.as_int()) else {
+            continue;
         };
 
-        modes.insert(mode, count);
+        modes.insert(mode, (alpha + 1, beta + 1));
     }
 
-    if modes.values().all(|&count| count == 0) {
+    if modes
+        .iter()
+        .all(|(_, (alpha, beta))| *alpha == 1 && *beta == 1)
+    {
         return Ok(ScanMode::Slash0);
     }
 
-    let mut modes = modes.into_iter().collect::<Vec<_>>();
-    let dist = WeightedIndex::new(
-        modes
-            .iter()
-            .map(|(_, count)| (count * count) + 1)
-            .collect::<Vec<_>>(),
-    )
-    .context("creating weighted index")?;
-
-    Ok(modes.swap_remove(dist.sample(&mut rand::thread_rng())).0)
+    Ok(modes
+        .iter()
+        .max_by(|(_, (alpha_a, beta_a)), (_, (alpha_b, beta_b))| {
+            Beta::new(*alpha_a as f64, *beta_a as f64)
+                .unwrap()
+                .inverse_cdf(confidence)
+                .partial_cmp(
+                    &Beta::new(*alpha_b as f64, *beta_b as f64)
+                        .unwrap()
+                        .inverse_cdf(confidence),
+                )
+                .unwrap()
+        })
+        .unwrap()
+        .0
+        .clone())
 }

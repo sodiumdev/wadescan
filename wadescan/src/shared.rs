@@ -1,11 +1,8 @@
 use std::{cell::UnsafeCell, net::Ipv4Addr, ops::Deref, sync::Arc};
 
-use mongodb::{
-    bson,
-    bson::{doc, Bson, DateTime, Document},
-};
+use mongodb::bson::{Bson, DateTime};
 
-use crate::{mode::ScanMode, ping::Response};
+use crate::mode::ScanMode;
 
 pub const FRAME_SIZE: u32 = 1 << 12;
 
@@ -15,19 +12,7 @@ pub struct ServerInfo {
     pub port: u16,
     pub found_at: DateTime,
     pub found_by: ScanMode,
-    pub response: Response,
-}
-
-impl ServerInfo {
-    pub fn into_document(self) -> Document {
-        doc! {
-            "ip": self.ip.to_bits() as i64,
-            "port": self.port as i32,
-            "found_at": self.found_at,
-            "found_by": self.found_by,
-            "response": bson::to_bson(&self.response).unwrap()
-        }
-    }
+    pub response: Bson,
 }
 
 #[repr(transparent)]

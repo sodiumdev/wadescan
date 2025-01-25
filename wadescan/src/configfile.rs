@@ -2,7 +2,7 @@ use std::{fs, num::NonZeroU32, time::Duration};
 
 use anyhow::Context;
 use serde::Deserialize;
-use serde_with::{serde_as, DurationSeconds};
+use serde_with::{DurationSeconds, serde_as};
 
 #[derive(Deserialize)]
 pub struct Configfile {
@@ -18,8 +18,8 @@ pub struct Configfile {
 pub struct DatabaseConfig {
     pub url: String,
     pub name: String,
-    pub collection_name: String,
-    pub threads: usize,
+    pub modes_collection: String,
+    pub servers_collection: String,
 }
 
 #[derive(Deserialize)]
@@ -35,6 +35,7 @@ pub struct ScannerConfig {
     #[serde_as(as = "DurationSeconds<u64>")]
     pub settling_delay: Duration,
 
+    pub confidence: f64,
     pub target: ScannerTarget,
 }
 

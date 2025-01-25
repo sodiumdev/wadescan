@@ -1,10 +1,10 @@
-use std::{hint, net::Ipv4Addr};
+use std::net::Ipv4Addr;
 
 use log::{debug, trace};
 use strength_reduce::StrengthReducedUsize;
-use xdpilone::{xdp::XdpDesc, BufIdx, RingTx, Umem};
+use xdpilone::{BufIdx, RingTx, Umem, xdp::XdpDesc};
 
-use crate::{checksum, FRAME_SIZE};
+use crate::{FRAME_SIZE, checksum};
 
 static SYN_PACKET: [u8; 62] = [
     // ETHER : [0..14]

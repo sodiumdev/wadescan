@@ -10,17 +10,14 @@ use aya::maps::{MapData, RingBuf};
 use dashmap::DashMap;
 use flume::Sender;
 use log::{debug, trace};
-use mongodb::{
-    bson::{DateTime, Document},
-    Collection,
-};
+use mongodb::bson::DateTime;
 use rustc_hash::FxBuildHasher;
 use tokio::io::unix::AsyncFd;
 use wadescan_common::{PacketHeader, PacketType};
 
 use crate::{
     checksum, ping,
-    ping::{PingParseError, RawLatest},
+    ping::PingParseError,
     sender::ResponseSender,
     shared::{ServerInfo, SharedData},
 };
@@ -38,8 +35,6 @@ pub struct ConnectionState {
 pub type ConnectionMap = Arc<DashMap<(Ipv4Addr, u16), ConnectionState, FxBuildHasher>>;
 
 pub struct Responder<'a> {
-    collection: Collection<Document>,
-
     connections: ConnectionMap,
     sender: ResponseSender<'a>,
 
@@ -61,7 +56,6 @@ pub enum TickResult {
 impl<'a> Responder<'a> {
     #[inline]
     pub fn new(
-        collection: Collection<Document>,
         connections: ConnectionMap,
         seed: u64,
         ring_buf: RingBuf<MapData>,
@@ -73,8 +67,6 @@ impl<'a> Responder<'a> {
         let fd = AsyncFd::new(ring_buf).ok()?;
 
         Some(Self {
-            collection,
-
             connections,
             sender,
 
@@ -110,7 +102,9 @@ impl<'a> Responder<'a> {
                 PacketType::SynAck => {
                     let expected = checksum::cookie(&ip, port, self.seed) + 1;
                     if ack != expected {
-                        trace!("cookie mismatch for {ip}:{port} at SYN+ACK (expected {expected}, got {ack})");
+                        trace!(
+                            "cookie mismatch for {ip}:{port} at SYN+ACK (expected {expected}, got {ack})"
+                        );
 
                         continue;
                     }
@@ -140,7 +134,9 @@ impl<'a> Responder<'a> {
                         self.connections.get_mut(&(ip, port))
                     {
                         if seq != conn.remote_seq {
-                            trace!("got wrong seq number! this is probably because of a retransmission");
+                            trace!(
+                                "got wrong seq number! this is probably because of a retransmission"
+                            );
 
                             self.sender.send_ack(&ip, port, ack, conn.remote_seq);
 
@@ -155,7 +151,9 @@ impl<'a> Responder<'a> {
                         let expected = checksum::cookie(&ip, port, self.seed)
                             .wrapping_add((self.ping_data.len() + 1) as u32);
                         if ack != expected {
-                            trace!("cookie mismatch for {ip}:{port} at ACK (expected {expected}, got {ack})");
+                            trace!(
+                                "cookie mismatch for {ip}:{port} at ACK (expected {expected}, got {ack})"
+                            );
 
                             continue;
                         }
@@ -165,16 +163,13 @@ impl<'a> Responder<'a> {
                             Err(PingParseError::Invalid) => {}
 
                             _ => {
-                                self.connections.insert(
-                                    (ip, port),
-                                    ConnectionState {
-                                        data: data.to_vec(),
-                                        remote_seq,
-                                        local_seq: ack,
-                                        started: Instant::now(),
-                                        fin_sent: false,
-                                    },
-                                );
+                                self.connections.insert((ip, port), ConnectionState {
+                                    data: data.to_vec(),
+                                    remote_seq,
+                                    local_seq: ack,
+                                    started: Instant::now(),
+                                    fin_sent: false,
+                                });
                             }
                         };
 
@@ -182,22 +177,16 @@ impl<'a> Responder<'a> {
                     };
 
                     match ping_response {
-                        Ok(data) => {
+                        Ok(response) => {
                             debug!("found server at ({ip}:{port})");
 
-                            if let Ok(mut raw) = serde_json::from_slice::<RawLatest>(&data) {
-                                raw.raw_json = data;
-
-                                if let Ok(response) = raw.try_into() {
-                                    _ = self.server_sender.try_send(ServerInfo {
-                                        ip,
-                                        port,
-                                        found_at: DateTime::now(),
-                                        found_by: self.shared_data.get_mode().clone().unwrap(),
-                                        response,
-                                    });
-                                }
-                            }
+                            _ = self.server_sender.try_send(ServerInfo {
+                                ip,
+                                port,
+                                found_at: DateTime::now(),
+                                found_by: self.shared_data.get_mode().clone().unwrap(),
+                                response,
+                            });
 
                             self.sender.send_ack(&ip, port, ack, remote_seq);
                             self.sender.send_fin(&ip, port, ack, remote_seq);
