@@ -459,23 +459,26 @@ impl ModePicker {
 
     #[inline]
     pub fn pick(&mut self) -> anyhow::Result<ScanMode> {
-        let mode = self
-            .modes
-            .iter()
-            .map(|(mode, stats)| {
-                if stats.selected == 0 {
-                    return (mode.clone(), f64::INFINITY);
-                }
+        let mode = if self.modes.values().all(|stats| stats.found == 0) {
+            ScanMode::Slash0
+        } else {
+            self.modes
+                .iter()
+                .map(|(mode, stats)| {
+                    if stats.selected == 0 {
+                        return (mode.clone(), f64::INFINITY);
+                    }
 
-                let average_reward = stats.found as f64 / stats.selected as f64;
-                let exploration_term =
-                    self.confidence * ((self.scans as f64).ln() / stats.selected as f64).sqrt();
+                    let average_reward = stats.found as f64 / stats.selected as f64;
+                    let exploration_term =
+                        self.confidence * ((self.scans as f64).ln() / stats.selected as f64).sqrt();
 
-                (mode.clone(), average_reward + exploration_term)
-            })
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-            .context("modes map is empty?")?
-            .0;
+                    (mode.clone(), average_reward + exploration_term)
+                })
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .context("modes map is empty?")?
+                .0
+        };
 
         self.modify(mode.clone(), |info| info.selected += 1);
         self.scans += 1;
