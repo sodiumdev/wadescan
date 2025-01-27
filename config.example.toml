@@ -6,7 +6,6 @@
 url = "mongodb://REPLACE-ME"
 # mongoDB collection
 name = "mcscanner"
-modes_collection = "modes"
 servers_collection = "servers"
 
 # SLP scanner
@@ -21,7 +20,7 @@ protocol_version = 767
 [scanner]
 # The amount of time in seconds to wait after each scan to settle down connections, ideally same as the purger timeout
 settling_delay = 10
-# confidence value of the Bayesian UCB algorithm for the scanner to adapt
+# confidence value of the UCB algorithm for the scanner to adapt
 # must be between 0 and 1, will break otherwise
 confidence = 0.8
 # The amount of packets to send every session

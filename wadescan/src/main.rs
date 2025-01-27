@@ -32,13 +32,11 @@ use dashmap::DashMap;
 use default_net::get_interfaces;
 use log::error;
 use mongodb::Client;
-use rand::Rng;
 use rustc_hash::FxBuildHasher;
 use xdpilone::{IfInfo, Socket, SocketConfig, Umem, UmemConfig};
 
 use crate::{
     completer::{PacketCompleter, Printer},
-    processor::Processor,
     responder::{Purger, Responder, TickResult},
     scanner::Scanner,
     sender::{ResponseSender, SynSender},
@@ -176,7 +174,6 @@ async fn main() -> anyhow::Result<()> {
         .expect("failed to initiate database connection");
 
     let database = client.database(&configfile.database.name);
-    let modes_collection = database.collection(&configfile.database.modes_collection);
     let servers_collection = database.collection(&configfile.database.servers_collection);
 
     let shared_data = SharedData::default();
@@ -263,7 +260,6 @@ async fn main() -> anyhow::Result<()> {
     // this is the part that actually scans and adapts
     let mut scanner = Scanner::new(
         servers_collection,
-        modes_collection,
         seed,
         excludefile,
         syn_sender,

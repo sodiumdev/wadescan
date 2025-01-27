@@ -18,7 +18,6 @@ pub struct Configfile {
 pub struct DatabaseConfig {
     pub url: String,
     pub name: String,
-    pub modes_collection: String,
     pub servers_collection: String,
 }
 

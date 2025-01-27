@@ -1,15 +1,15 @@
 // thanks mat
 
-use std::{collections::HashMap, net::Ipv4Addr, str::FromStr};
+use std::{net::Ipv4Addr, path::Path, str::FromStr};
 
 use anyhow::{Context, anyhow, bail};
-use futures::TryStreamExt;
+use futures::{FutureExt, TryStreamExt};
 use mongodb::{
     Collection,
     bson::{Bson, Document, doc},
 };
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use serde::{Deserialize, Serialize};
-use statrs::distribution::{Beta, ContinuousCDF};
 
 use crate::{range::ScanRange, shared::BsonExt};
 
@@ -19,11 +19,6 @@ macro_rules! scan_mode {
         #[derive(Debug, Hash, Eq, PartialEq, Clone, Serialize, Deserialize)]
         pub enum ScanMode {
             $($variant),*
-        }
-
-        #[inline(always)]
-        const fn _count(_a: &str) -> usize {
-            1
         }
 
         impl ScanMode {
@@ -140,7 +135,7 @@ async fn slash0_few_ports(collection: &Collection<Document>) -> anyhow::Result<V
         ranges.push(ScanRange::single_port(
             Ipv4Addr::new(0, 0, 0, 0),
             Ipv4Addr::new(255, 255, 255, 255),
-            doc.get("_id").and_then(|r| r.as_i32()).unwrap() as u16,
+            doc.get("_id").and_then(|r| r.as_int()).unwrap() as u16,
         ));
     }
 
@@ -229,29 +224,19 @@ async fn slash24_all_ports(collection: &Collection<Document>) -> anyhow::Result<
 #[inline(always)]
 async fn slash24_range(collection: &Collection<Document>) -> anyhow::Result<Vec<ScanRange>> {
     let mut cursor = collection
-        .aggregate([
-            doc! {
-                "$group": {
-                    "_id": { "$floor": { "$divide": ["$ip", 256] } },
-                    "min_port": { "$min": "$port" },
-                    "max_port": { "$max": "$port" }
-                }
-            },
-            doc! {
-                "$project": {
-                    "_id": 0,
-                    "ip": "$_id",
-                    "min_port": 1,
-                    "max_port": 1,
-                }
-            },
-        ])
+        .aggregate([doc! {
+            "$group": {
+                "_id": { "$floor": { "$divide": ["$ip", 256] } },
+                "min_port": { "$min": "$port" },
+                "max_port": { "$max": "$port" }
+            }
+        }])
         .await
         .context("aggregating data")?;
 
     let mut ranges = Vec::new();
     while let Some(doc) = cursor.try_next().await? {
-        let ip24 = doc.get("ip").and_then(|r| r.as_int()).unwrap() as u32;
+        let ip24 = doc.get("_id").and_then(|r| r.as_int()).unwrap() as u32;
         let ip24_a = ((ip24 >> 16) & 0xFF) as u8;
         let ip24_b = ((ip24 >> 8) & 0xFF) as u8;
         let ip24_c = (ip24 & 0xFF) as u8;
@@ -259,8 +244,14 @@ async fn slash24_range(collection: &Collection<Document>) -> anyhow::Result<Vec<
         ranges.push(ScanRange {
             addr_start: Ipv4Addr::new(ip24_a, ip24_b, ip24_c, 0),
             addr_end: Ipv4Addr::new(ip24_a, ip24_b, ip24_c, 255),
-            port_start: doc.get("min_port").and_then(|val| val.as_int()).unwrap() as u16,
-            port_end: doc.get("max_port").and_then(|val| val.as_int()).unwrap() as u16,
+            port_start: doc
+                .get("min_port")
+                .and_then(|val| val.as_int())
+                .context("fetching min port")? as u16,
+            port_end: doc
+                .get("max_port")
+                .and_then(|val| val.as_int())
+                .context("fetching max port")? as u16,
         });
     }
 
@@ -281,8 +272,6 @@ async fn slash24(collection: &Collection<Document>) -> anyhow::Result<Vec<ScanRa
             },
             doc! {
                 "$project": {
-                    "_id": 0,
-                    "ip": "$_id",
                     "top_ports": { "$slice": ["$top_ports", 64] }
                 }
             },
@@ -292,7 +281,10 @@ async fn slash24(collection: &Collection<Document>) -> anyhow::Result<Vec<ScanRa
 
     let mut ranges = Vec::new();
     while let Some(doc) = cursor.try_next().await? {
-        let ip24 = doc.get("ip").and_then(|r| r.as_int()).unwrap() as u32;
+        let ip24 = doc
+            .get("_id")
+            .and_then(|r| r.as_int())
+            .context("fetching ip")? as u32;
         let ip24_a = ((ip24 >> 16) & 0xFF) as u8;
         let ip24_b = ((ip24 >> 8) & 0xFF) as u8;
         let ip24_c = (ip24 & 0xFF) as u8;
@@ -301,7 +293,7 @@ async fn slash24(collection: &Collection<Document>) -> anyhow::Result<Vec<ScanRa
             ranges.push(ScanRange::single_port(
                 Ipv4Addr::new(ip24_a, ip24_b, ip24_c, 0),
                 Ipv4Addr::new(ip24_a, ip24_b, ip24_c, 255),
-                port.as_int().ok_or(anyhow!("port not int somehow"))? as u16,
+                port.as_int().context("fetching port")? as u16,
             ));
         }
     }
@@ -323,8 +315,6 @@ async fn slash16(collection: &Collection<Document>) -> anyhow::Result<Vec<ScanRa
             },
             doc! {
                 "$project": {
-                    "_id": 0,
-                    "ip": "$_id",
                     "top_ports": { "$slice": ["$top_ports", 64] }
                 }
             },
@@ -334,7 +324,7 @@ async fn slash16(collection: &Collection<Document>) -> anyhow::Result<Vec<ScanRa
 
     let mut ranges = Vec::new();
     while let Some(doc) = cursor.try_next().await? {
-        let ip24 = doc.get("ip").and_then(|r| r.as_int()).unwrap() as u32;
+        let ip24 = doc.get("_id").and_then(|r| r.as_int()).unwrap() as u32;
         let ip24_a = ((ip24 >> 8) & 0xFF) as u8;
         let ip24_b = (ip24 & 0xFF) as u8;
 
@@ -353,25 +343,17 @@ async fn slash16(collection: &Collection<Document>) -> anyhow::Result<Vec<ScanRa
 #[inline(always)]
 async fn slash16_all_ports(collection: &Collection<Document>) -> anyhow::Result<Vec<ScanRange>> {
     let mut cursor = collection
-        .aggregate([
-            doc! {
-                "$group": {
-                    "_id": { "$floor": { "$divide": ["$ip", 65536] } },
-                }
-            },
-            doc! {
-                "$project": {
-                    "_id": 0,
-                    "ip": "$_id"
-                }
-            },
-        ])
+        .aggregate([doc! {
+            "$group": {
+                "_id": { "$floor": { "$divide": ["$ip", 65536] } },
+            }
+        }])
         .await
         .context("aggregating data")?;
 
     let mut ranges = Vec::new();
     while let Some(doc) = cursor.try_next().await? {
-        let ip24 = doc.get("ip").and_then(|r| r.as_int()).unwrap() as u32;
+        let ip24 = doc.get("_id").and_then(|r| r.as_int()).unwrap() as u32;
         let ip24_a = ((ip24 >> 8) & 0xFF) as u8;
         let ip24_b = (ip24 & 0xFF) as u8;
 
@@ -401,49 +383,103 @@ async fn slash32_all(_collection: &Collection<Document>) -> anyhow::Result<Vec<S
     bail!("unimplemented")
 }
 
-pub async fn pick(confidence: f64, collection: &Collection<Document>) -> anyhow::Result<ScanMode> {
-    let mut cursor = collection.find(doc! {}).await.context("aggregating data")?;
+#[derive(Serialize, Deserialize)]
+pub struct ScanModeInfo {
+    selected: usize,
+    found: usize,
+}
 
-    let mut modes = HashMap::new();
-    for mode in MODES {
-        modes.insert(mode.clone(), (1, 1));
+#[derive(Serialize, Deserialize)]
+pub struct ModePicker {
+    #[serde(skip_serializing)]
+    confidence: f64,
+
+    scans: usize,
+    modes: FxHashMap<ScanMode, ScanModeInfo>,
+}
+
+impl ModePicker {
+    #[inline]
+    fn default(confidence: f64) -> ModePicker {
+        Self {
+            confidence,
+
+            scans: 0,
+            modes: {
+                let mut map = FxHashMap::with_hasher(FxBuildHasher);
+                for mode in MODES {
+                    map.insert(mode.clone(), ScanModeInfo {
+                        selected: 0,
+                        found: 0,
+                    });
+                }
+
+                map
+            },
+        }
     }
 
-    while let Some(document) = cursor.try_next().await? {
-        let Ok(mode) = ScanMode::from_str(document.get_str("mode")?) else {
-            continue;
-        };
-        let Some(alpha) = document.get("alpha").and_then(|r| r.as_int()) else {
-            continue;
-        };
-        let Some(beta) = document.get("beta").and_then(|r| r.as_int()) else {
-            continue;
+    #[inline]
+    pub fn load(file: impl AsRef<Path>, confidence: f64) -> Self {
+        let Ok(contents) = std::fs::read_to_string(file) else {
+            return Self::default(confidence);
         };
 
-        modes.insert(mode, (alpha + 1, beta + 1));
+        match serde_json::from_str(&contents).map(|mut this: ModePicker| {
+            this.confidence = confidence;
+            this
+        }) {
+            Ok(this) => this,
+            Err(_) => Self::default(confidence),
+        }
     }
 
-    if modes
-        .iter()
-        .all(|(_, (alpha, beta))| *alpha == 1 && *beta == 1)
-    {
-        return Ok(ScanMode::Slash0);
+    #[inline(always)]
+    fn modify(&mut self, mode: ScanMode, f: impl FnOnce(&mut ScanModeInfo)) {
+        self.modes
+            .entry(mode)
+            .and_modify(f)
+            .or_insert_with(|| ScanModeInfo {
+                selected: 0,
+                found: 0,
+            });
     }
 
-    Ok(modes
-        .iter()
-        .max_by(|(_, (alpha_a, beta_a)), (_, (alpha_b, beta_b))| {
-            Beta::new(*alpha_a as f64, *beta_a as f64)
-                .unwrap()
-                .inverse_cdf(confidence)
-                .partial_cmp(
-                    &Beta::new(*alpha_b as f64, *beta_b as f64)
-                        .unwrap()
-                        .inverse_cdf(confidence),
-                )
-                .unwrap()
-        })
-        .unwrap()
-        .0
-        .clone())
+    #[inline]
+    pub fn found(&mut self, mode: ScanMode, found: usize) {
+        self.modify(mode, |info| info.found += found);
+    }
+
+    #[inline]
+    pub fn save(&self, file: impl AsRef<Path>) -> anyhow::Result<()> {
+        let content = serde_json::to_string_pretty(self).context("serializing json")?;
+
+        std::fs::write(file, content).context("writing file")
+    }
+
+    #[inline]
+    pub fn pick(&mut self) -> anyhow::Result<ScanMode> {
+        let mode = self
+            .modes
+            .iter()
+            .map(|(mode, stats)| {
+                if stats.selected == 0 {
+                    return (mode.clone(), f64::INFINITY);
+                }
+
+                let average_reward = stats.found as f64 / stats.selected as f64;
+                let exploration_term =
+                    self.confidence * ((self.scans as f64).ln() / stats.selected as f64).sqrt();
+
+                (mode.clone(), average_reward + exploration_term)
+            })
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .context("modes map is empty?")?
+            .0;
+
+        self.modify(mode.clone(), |info| info.selected += 1);
+        self.scans += 1;
+
+        Ok(mode)
+    }
 }

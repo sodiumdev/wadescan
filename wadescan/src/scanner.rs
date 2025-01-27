@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use flume::Receiver;
-use log::info;
+use log::{info, trace};
 use mongodb::{
     Collection,
     bson::{DateTime, Document, doc},
@@ -11,7 +11,7 @@ use mongodb::{
 use perfect_rand::PerfectRng;
 
 use crate::{
-    mode,
+    mode::ModePicker,
     range::{Ipv4Ranges, StaticScanRanges},
     sender::SynSender,
     shared::{ServerInfo, SharedData},
@@ -26,9 +26,9 @@ pub struct Scanner<'a> {
     sender: SynSender<'a>,
 
     servers_collection: Collection<Document>,
-    modes_collection: Collection<Document>,
 
-    confidence: f64,
+    mode_picker: ModePicker,
+
     settling_delay: Duration,
     receiver: Receiver<ServerInfo>,
 
@@ -39,7 +39,6 @@ impl<'a> Scanner<'a> {
     #[inline]
     pub fn new(
         servers_collection: Collection<Document>,
-        modes_collection: Collection<Document>,
         seed: u64,
         excludes: Ipv4Ranges,
         sender: SynSender<'a>,
@@ -58,9 +57,8 @@ impl<'a> Scanner<'a> {
             sender,
 
             servers_collection,
-            modes_collection,
 
-            confidence,
+            mode_picker: ModePicker::load("modes.json", confidence),
             settling_delay,
             receiver,
 
@@ -70,14 +68,19 @@ impl<'a> Scanner<'a> {
 
     #[inline]
     pub async fn tick(&mut self) -> anyhow::Result<()> {
-        let mode = mode::pick(self.confidence, &self.modes_collection).await?;
-        let current_mode = mode.clone();
+        trace!("picking mode...");
+
+        let mode = self.mode_picker.pick()?;
+
+        trace!("picked mode {mode:?}, calculating ranges");
 
         let ranges = StaticScanRanges::from_excluding(
             mode.ranges(&self.servers_collection).await?,
             &self.excludes,
         );
+
         let packet_count = u64::min(ranges.count as u64, self.packet_count);
+
         info!("spewing {packet_count} packets with mode {mode:?}");
 
         self.shared_data.set_mode(mode);
@@ -97,8 +100,16 @@ impl<'a> Scanner<'a> {
 
         tokio::time::sleep(self.settling_delay).await;
 
-        info!("done waiting, adapting to and processing results");
+        info!("done waiting, processing and adapting to results");
+
         let found = self.receiver.len();
+        self.mode_picker
+            .found(self.shared_data.get_mode().clone().unwrap(), found);
+
+        self.mode_picker
+            .save("modes.json")
+            .context("saving modes")?;
+
         let mut models = Vec::with_capacity(found);
         while let Ok(server) = self.receiver.try_recv() {
             models.push(
@@ -107,33 +118,13 @@ impl<'a> Scanner<'a> {
                         .namespace(self.servers_collection.namespace())
                         .filter(doc! { "ip": server.ip.to_bits() as i64, "port": server.port as i32 })
                         .update(doc! { "$push": {
-                            "pings": { "at": DateTime::now(), "by": &current_mode, "response": server.response }
+                            "pings": { "at": DateTime::now(), "by": self.shared_data.get_mode().clone().unwrap(), "response": server.response }
                         } })
                         .upsert(true)
                         .build()
                 )
             );
         }
-
-        let not_found = packet_count as i64 - found as i64;
-
-        self.modes_collection
-            .update_one(
-                doc! {
-                    "mode": current_mode
-                },
-                doc! {
-                    "$set": {
-                        "timestamp": DateTime::now(),
-                    },
-                    "$inc": {
-                        "alpha": found as i64,
-                        "beta": not_found
-                    }
-                },
-            )
-            .upsert(true)
-            .await?;
 
         self.servers_collection
             .client()
