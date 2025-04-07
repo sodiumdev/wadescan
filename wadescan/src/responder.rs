@@ -15,12 +15,7 @@ use rustc_hash::FxBuildHasher;
 use tokio::io::unix::AsyncFd;
 use wadescan_common::{PacketHeader, PacketType};
 
-use crate::{
-    checksum, ping,
-    ping::PingParseError,
-    sender::ResponseSender,
-    shared::{ServerInfo, SharedData},
-};
+use crate::{checksum, ping, ping::PingParseError, sender::ResponseSender, shared::ServerInfo};
 
 pub struct ConnectionState {
     data: Vec<u8>,
@@ -43,8 +38,6 @@ pub struct Responder<'a> {
 
     server_sender: Sender<ServerInfo>,
     ping_data: &'static [u8],
-
-    shared_data: SharedData,
 }
 
 #[repr(u8)]
@@ -62,7 +55,6 @@ impl<'a> Responder<'a> {
         sender: ResponseSender<'a>,
         server_sender: Sender<ServerInfo>,
         ping_data: &'static [u8],
-        shared_data: SharedData,
     ) -> Option<Self> {
         let fd = AsyncFd::new(ring_buf).ok()?;
 
@@ -75,15 +67,13 @@ impl<'a> Responder<'a> {
 
             server_sender,
             ping_data,
-
-            shared_data,
         })
     }
 
     #[inline]
-    pub async fn tick(&mut self) -> TickResult {
+    pub async fn tick(&mut self) -> bool {
         let Ok(mut guard) = self.fd.readable_mut().await else {
-            return TickResult::Stop;
+            return true;
         };
 
         let ring_buf = guard.get_inner_mut();
@@ -178,13 +168,10 @@ impl<'a> Responder<'a> {
 
                     match ping_response {
                         Ok(response) => {
-                            debug!("found server at ({ip}:{port})");
-
                             _ = self.server_sender.try_send(ServerInfo {
                                 ip,
                                 port,
                                 found_at: DateTime::now(),
-                                found_by: self.shared_data.get_mode().clone().unwrap(),
                                 response,
                             });
 
@@ -193,7 +180,7 @@ impl<'a> Responder<'a> {
                         }
 
                         Err(PingParseError::Invalid) => {
-                            trace!("invalid response from {ip}:{port}");
+                            trace!("invalid response from {ip}:{port}, ignoring");
                         }
 
                         Err(PingParseError::Incomplete) => {
@@ -213,7 +200,7 @@ impl<'a> Responder<'a> {
                         }
 
                         if !conn.data.is_empty() {
-                            drop(conn);
+                            drop(conn); // important! we must not hold any references to the map to remove entries
 
                             self.connections.remove(&(ip, port));
                         }
@@ -226,7 +213,7 @@ impl<'a> Responder<'a> {
 
         guard.clear_ready();
 
-        TickResult::Continue
+        false
     }
 }
 

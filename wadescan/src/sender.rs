@@ -62,11 +62,6 @@ static OTHER_PACKET: [u8; 58] = [
 
 type Frame<'a> = (u64, &'a mut [u8]);
 
-struct Tx(RingTx);
-
-unsafe impl Send for Tx {}
-unsafe impl Sync for Tx {}
-
 // NOT thread-safe
 pub struct SynSender<'a> {
     frames: Vec<Frame<'a>>,
@@ -75,7 +70,7 @@ pub struct SynSender<'a> {
     len: usize,
 
     source_ip: Ipv4Addr,
-    tx: Tx,
+    tx: RingTx,
 }
 
 impl SynSender<'_> {
@@ -116,7 +111,7 @@ impl SynSender<'_> {
             len: syn_len,
 
             source_ip,
-            tx: Tx(tx),
+            tx,
         }
     }
 
@@ -163,7 +158,7 @@ impl SynSender<'_> {
         }
 
         {
-            let mut writer = self.tx.0.transmit(1);
+            let mut writer = self.tx.transmit(1);
             writer.insert_once(XdpDesc {
                 addr: *addr + start as u64,
                 len: self.len as u32,
@@ -173,8 +168,8 @@ impl SynSender<'_> {
             writer.commit();
         }
 
-        if self.tx.0.needs_wakeup() {
-            self.tx.0.wake();
+        if self.tx.needs_wakeup() {
+            self.tx.wake();
         }
     }
 }
@@ -197,7 +192,7 @@ pub struct ResponseSender<'a> {
 
     source_ip: Ipv4Addr,
 
-    tx: Tx,
+    tx: RingTx,
 }
 
 impl ResponseSender<'_> {
@@ -299,7 +294,7 @@ impl ResponseSender<'_> {
 
             source_ip,
 
-            tx: Tx(tx),
+            tx,
         }
     }
 
@@ -349,7 +344,7 @@ impl ResponseSender<'_> {
         }
 
         {
-            let mut writer = self.tx.0.transmit(1);
+            let mut writer = self.tx.transmit(1);
             writer.insert_once(XdpDesc {
                 addr: *addr + start as u64,
                 len: self.ack_len as u32,
@@ -359,8 +354,8 @@ impl ResponseSender<'_> {
             writer.commit();
         }
 
-        if self.tx.0.needs_wakeup() {
-            self.tx.0.wake();
+        if self.tx.needs_wakeup() {
+            self.tx.wake();
         }
     }
 
@@ -409,7 +404,7 @@ impl ResponseSender<'_> {
         }
 
         {
-            let mut writer = self.tx.0.transmit(1);
+            let mut writer = self.tx.transmit(1);
             writer.insert_once(XdpDesc {
                 addr: *addr + start as u64,
                 len: self.psh_len as u32,
@@ -465,7 +460,7 @@ impl ResponseSender<'_> {
         }
 
         {
-            let mut writer = self.tx.0.transmit(1);
+            let mut writer = self.tx.transmit(1);
             writer.insert_once(XdpDesc {
                 addr: *addr + start as u64,
                 len: self.fin_len as u32,

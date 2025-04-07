@@ -35,19 +35,12 @@ impl Processor {
 
         match self
             .collection
-            .update_one(
-                doc! { "ip": ip.to_bits() as i64, "port": port as i32 },
-                doc! {
-                    "$push": {
-                        "pings": {
-                            "at": server_info.found_at,
-                            "by": server_info.found_by,
-                            "response": server_info.response
-                        }
-                    }
-                },
-            )
-            .upsert(true)
+            .insert_one(doc! {
+                "ip": ip.to_bits() as i64,
+                "port": port as i32,
+                "at": server_info.found_at,
+                "response": server_info.response
+            })
             .await
         {
             Ok(_) => info!("inserted {}:{} into database", ip, port),

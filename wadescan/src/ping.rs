@@ -81,7 +81,7 @@ pub fn parse_response(response: &[u8]) -> Result<Bson, PingParseError> {
     }
 
     let Ok(raw) = serde_json::from_slice::<serde_json::Value>(status_buffer) else {
-        return Err(PingParseError::Invalid); // not a minecraft server i guess
+        return Err(PingParseError::Invalid);
     };
 
     match bson::to_bson(&raw) {

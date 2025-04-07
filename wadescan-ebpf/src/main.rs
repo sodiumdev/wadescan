@@ -36,17 +36,17 @@ pub fn wadescan(ctx: XdpContext) -> u32 {
 
 #[inline(always)]
 fn try_receive(ctx: XdpContext) -> Result<u32, ()> {
-    let eth_hdr = unsafe { ptr_at::<EthHdr>(&ctx, 0)? };
+    let eth_hdr = ptr_at::<EthHdr>(&ctx, 0)?;
     if unsafe { (*eth_hdr).ether_type } != EtherType::Ipv4 {
         return Ok(XDP_PASS);
     }
 
-    let ip_hdr = unsafe { ptr_at::<Ipv4Hdr>(&ctx, EthHdr::LEN)? };
+    let ip_hdr = ptr_at::<Ipv4Hdr>(&ctx, EthHdr::LEN)?;
     if unsafe { (*ip_hdr).proto } != IpProto::Tcp {
         return Ok(XDP_PASS);
     }
 
-    let tcp_hdr = unsafe { ptr_at::<TcpHdr>(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)? };
+    let tcp_hdr = ptr_at::<TcpHdr>(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
     if unsafe { (*tcp_hdr).dest } != PORT {
         return Ok(XDP_PASS);
     }
@@ -101,7 +101,7 @@ fn try_receive(ctx: XdpContext) -> Result<u32, ()> {
 }
 
 #[inline(always)]
-const unsafe fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
+const fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
     let start = unsafe { &*ctx.ctx }.data as usize;
     let end = unsafe { &*ctx.ctx }.data_end as usize;
     let len = size_of::<T>();

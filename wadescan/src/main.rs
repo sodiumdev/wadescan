@@ -20,7 +20,7 @@ use std::{
     env,
     ffi::CString,
     ptr::NonNull,
-    sync::{Arc, atomic::AtomicUsize},
+    sync::Arc,
 };
 
 use anyhow::Context;
@@ -30,20 +30,21 @@ use aya::{
 };
 use dashmap::DashMap;
 use default_net::get_interfaces;
-use log::error;
+use log::{error, info};
 use mongodb::Client;
 use rustc_hash::FxBuildHasher;
 use xdpilone::{IfInfo, Socket, SocketConfig, Umem, UmemConfig};
 
 use crate::{
-    completer::{PacketCompleter, Printer},
-    responder::{Purger, Responder, TickResult},
+    completer::PacketCompleter,
+    processor::Processor,
+    responder::{Purger, Responder},
     scanner::Scanner,
     sender::{ResponseSender, SynSender},
-    shared::{FRAME_SIZE, SharedData},
+    shared::FRAME_SIZE,
 };
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 16)]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
 
@@ -53,8 +54,8 @@ async fn main() -> anyhow::Result<()> {
         libc::setrlimit(libc::RLIMIT_MEMLOCK, &libc::rlimit {
             rlim_cur: libc::RLIM_INFINITY,
             rlim_max: libc::RLIM_INFINITY,
-        })
-    };
+        });
+    }
 
     let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
@@ -176,9 +177,6 @@ async fn main() -> anyhow::Result<()> {
     let database = client.database(&configfile.database.name);
     let servers_collection = database.collection(&configfile.database.servers_collection);
 
-    let shared_data = SharedData::default();
-    let shared_data_scanner = shared_data.clone();
-
     let tx = responder_rxtx
         .map_tx()
         .expect("failed to map tx for responder");
@@ -192,24 +190,25 @@ async fn main() -> anyhow::Result<()> {
         &umem,
     );
 
-    let (sender, receiver) = flume::unbounded();
+    let (ping_sender, ping_receiver) = flume::unbounded();
     tokio::spawn(async move {
         let mut responder = Responder::new(
             connections,
             seed,
             ring_buf,
             response_sender,
-            sender,
+            ping_sender,
             ping_data,
-            shared_data,
         )
         .expect("failed to initiate responder");
 
         loop {
-            if let TickResult::Stop = responder.tick().await {
+            if responder.tick().await {
                 break;
             }
         }
+
+        info!("halting responder...")
     });
 
     tokio::spawn(async move {
@@ -224,55 +223,32 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let completed = Arc::new(AtomicUsize::new(0));
-    let completed_printer = completed.clone();
-
     tokio::spawn(async move {
-        let mut printer = Printer::new(completed_printer, configfile.printer.interval);
-
-        loop {
-            printer.tick().await;
-        }
-    });
-
-    tokio::spawn(async move {
-        let mut completer = PacketCompleter::new(device, completed);
+        let mut completer = PacketCompleter::new(device, configfile.printer.interval);
 
         loop {
             completer.tick();
         }
     });
 
-    // tokio::spawn(async move {
-    //     let database = Processor::new(collection, receiver);
-    //
-    //     loop {
-    //         if let Err(err) = database.tick().await {
-    //             error!("Error at database: {}", err);
-    //         };
-    //     }
-    // });
+    let ping_receiver_a = ping_receiver.clone();
+    tokio::spawn(async move {
+        let processor = Processor::new(servers_collection, ping_receiver_a);
+
+        loop {
+            if let Err(err) = processor.tick().await {
+                error!("Error at database: {}", err);
+            };
+        }
+    });
 
     // be ready to melt your fucking network!
     let tx = sender_rxtx.map_tx().expect("failed to map tx for scanner");
     let syn_sender = SynSender::new(tx, &gateway_mac, &interface_mac, source_ip, &umem);
 
-    // this is the part that actually scans and adapts
-    let mut scanner = Scanner::new(
-        servers_collection,
-        seed,
-        excludefile,
-        syn_sender,
-        shared_data_scanner,
-        configfile.scanner.settling_delay,
-        receiver,
-        configfile.scanner.target.into(),
-        configfile.scanner.confidence,
-    );
+    let mut scanner = Scanner::new(seed, excludefile, syn_sender, ping_receiver);
 
     loop {
-        if let Err(err) = scanner.tick().await {
-            error!("Error at scanner: {}", err);
-        };
+        _ = scanner.tick().await;
     }
 }

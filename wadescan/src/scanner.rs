@@ -1,136 +1,69 @@
-use std::time::Duration;
+use std::net::Ipv4Addr;
 
-use anyhow::Context;
 use flume::Receiver;
-use log::{info, trace};
-use mongodb::{
-    Collection,
-    bson::{DateTime, Document, doc},
-    options::{UpdateOneModel, WriteModel},
-};
 use perfect_rand::PerfectRng;
 
 use crate::{
-    mode::ModePicker,
-    range::{Ipv4Ranges, StaticScanRanges},
+    range::{Ipv4Ranges, ScanRange, StaticScanRanges},
     sender::SynSender,
-    shared::{ServerInfo, SharedData},
+    shared::ServerInfo,
 };
 
 pub struct Scanner<'a> {
-    shared_data: SharedData,
-
     seed: u64,
     excludes: Ipv4Ranges,
 
     sender: SynSender<'a>,
-
-    servers_collection: Collection<Document>,
-
-    mode_picker: ModePicker,
-
-    settling_delay: Duration,
     receiver: Receiver<ServerInfo>,
-
-    packet_count: u64,
 }
 
 impl<'a> Scanner<'a> {
     #[inline]
     pub fn new(
-        servers_collection: Collection<Document>,
         seed: u64,
         excludes: Ipv4Ranges,
         sender: SynSender<'a>,
-        shared_data: SharedData,
-        settling_delay: Duration,
         receiver: Receiver<ServerInfo>,
-        packet_count: u64,
-        confidence: f64,
     ) -> Self {
         Self {
-            shared_data,
-
             seed,
             excludes,
 
             sender,
 
-            servers_collection,
-
-            mode_picker: ModePicker::load("modes.json", confidence),
-            settling_delay,
             receiver,
-
-            packet_count,
         }
     }
 
     #[inline]
     pub async fn tick(&mut self) -> anyhow::Result<()> {
-        trace!("picking mode...");
+        /*
+        So, the strategy here is that the scanner always scans 0.0.0.0/0, but when it finds a server it automatically scans the adjacent ips with ALL strategies.
+        The term "adjacent" can change based on the strategy used, i.e. when a slash 32 strategy is used it just scans all ports on the same ip,
+        and when a slash 24 strategy is used it just scans all ports (maybe only 25565, thinking of changing that in the future) on a.b.c.0/24
 
-        let mode = self.mode_picker.pick()?;
+        There also should be a rescan feature which just scans everything in the database again, maybe the adjacent ips too
 
-        trace!("picked mode {mode:?}, calculating ranges");
+        Also!!! masscan gets me about 700 kpps, while my scanner gets 550 kpps. my scanner uses af_xdp but in my tests matscan (which uses raw sockets) gets about 300 kpps
+        */
 
         let ranges = StaticScanRanges::from_excluding(
-            mode.ranges(&self.servers_collection).await?,
+            vec![ScanRange {
+                addr_start: Ipv4Addr::new(0, 0, 0, 0),
+                addr_end: Ipv4Addr::new(255, 255, 255, 255),
+                port_start: 25565,
+                port_end: 25565,
+            }],
             &self.excludes,
         );
 
-        let packet_count = u64::min(ranges.count as u64, self.packet_count);
-
-        info!("spewing {packet_count} packets with mode {mode:?}");
-
-        self.shared_data.set_mode(mode);
-
         let rng = PerfectRng::new(ranges.count as u64, self.seed, 3);
-        for n in 0..packet_count {
+        for n in 0..(ranges.count as u64) {
             let index = rng.shuffle(n) as usize;
             let (ip, port) = ranges.index(index);
 
             self.sender.send_syn(&ip, port, self.seed);
         }
-
-        info!(
-            "done spewing, waiting {} seconds to settle down connections",
-            self.settling_delay.as_secs()
-        );
-
-        tokio::time::sleep(self.settling_delay).await;
-
-        info!("done waiting, processing and adapting to results");
-
-        let found = self.receiver.len();
-        self.mode_picker
-            .found(self.shared_data.get_mode().clone().unwrap(), found);
-
-        self.mode_picker
-            .save("modes.json")
-            .context("saving modes")?;
-
-        let mut models = Vec::with_capacity(found);
-        while let Ok(server) = self.receiver.try_recv() {
-            models.push(
-                WriteModel::UpdateOne(
-                    UpdateOneModel::builder()
-                        .namespace(self.servers_collection.namespace())
-                        .filter(doc! { "ip": server.ip.to_bits() as i64, "port": server.port as i32 })
-                        .update(doc! { "$push": {
-                            "pings": { "at": DateTime::now(), "by": self.shared_data.get_mode().clone().unwrap(), "response": server.response }
-                        } })
-                        .upsert(true)
-                        .build()
-                )
-            );
-        }
-
-        self.servers_collection
-            .client()
-            .bulk_write(models)
-            .await
-            .context("bulk-writing data")?;
 
         Ok(())
     }

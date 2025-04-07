@@ -1,6 +1,6 @@
 // thanks mat
 
-use std::{net::Ipv4Addr, path::Path, str::FromStr};
+use std::{net::Ipv4Addr, str::FromStr};
 
 use anyhow::{Context, anyhow, bail};
 use futures::{FutureExt, TryStreamExt};
@@ -8,7 +8,6 @@ use mongodb::{
     Collection,
     bson::{Bson, Document, doc},
 };
-use rustc_hash::{FxBuildHasher, FxHashMap};
 use serde::{Deserialize, Serialize};
 
 use crate::{range::ScanRange, shared::BsonExt};
@@ -315,6 +314,8 @@ async fn slash16(collection: &Collection<Document>) -> anyhow::Result<Vec<ScanRa
             },
             doc! {
                 "$project": {
+                    "_id": 0,
+                    "ip": "_id",
                     "top_ports": { "$slice": ["$top_ports", 64] }
                 }
             },
@@ -387,102 +388,4 @@ async fn slash32_all(_collection: &Collection<Document>) -> anyhow::Result<Vec<S
 pub struct ScanModeInfo {
     selected: usize,
     found: usize,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct ModePicker {
-    #[serde(skip_serializing)]
-    confidence: f64,
-
-    scans: usize,
-    modes: FxHashMap<ScanMode, ScanModeInfo>,
-}
-
-impl ModePicker {
-    #[inline]
-    fn default(confidence: f64) -> ModePicker {
-        Self {
-            confidence,
-
-            scans: 0,
-            modes: {
-                let mut map = FxHashMap::with_hasher(FxBuildHasher);
-                for mode in MODES {
-                    map.insert(mode.clone(), ScanModeInfo {
-                        selected: 0,
-                        found: 0,
-                    });
-                }
-
-                map
-            },
-        }
-    }
-
-    #[inline]
-    pub fn load(file: impl AsRef<Path>, confidence: f64) -> Self {
-        let Ok(contents) = std::fs::read_to_string(file) else {
-            return Self::default(confidence);
-        };
-
-        match serde_json::from_str(&contents).map(|mut this: ModePicker| {
-            this.confidence = confidence;
-            this
-        }) {
-            Ok(this) => this,
-            Err(_) => Self::default(confidence),
-        }
-    }
-
-    #[inline(always)]
-    fn modify(&mut self, mode: ScanMode, f: impl FnOnce(&mut ScanModeInfo)) {
-        self.modes
-            .entry(mode)
-            .and_modify(f)
-            .or_insert_with(|| ScanModeInfo {
-                selected: 0,
-                found: 0,
-            });
-    }
-
-    #[inline]
-    pub fn found(&mut self, mode: ScanMode, found: usize) {
-        self.modify(mode, |info| info.found += found);
-    }
-
-    #[inline]
-    pub fn save(&self, file: impl AsRef<Path>) -> anyhow::Result<()> {
-        let content = serde_json::to_string_pretty(self).context("serializing json")?;
-
-        std::fs::write(file, content).context("writing file")
-    }
-
-    #[inline]
-    pub fn pick(&mut self) -> anyhow::Result<ScanMode> {
-        let mode = if self.modes.values().all(|stats| stats.found == 0) {
-            ScanMode::Slash0
-        } else {
-            self.modes
-                .iter()
-                .map(|(mode, stats)| {
-                    if stats.selected == 0 {
-                        return (mode.clone(), f64::INFINITY);
-                    }
-
-                    let average_reward = stats.found as f64 / stats.selected as f64;
-                    let exploration_term =
-                        self.confidence * ((self.scans as f64).ln() / stats.selected as f64).sqrt();
-
-                    (mode.clone(), average_reward + exploration_term)
-                })
-                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-                .context("modes map is empty?")?
-                .0
-        };
-
-        self.modify(mode.clone(), |info| info.selected += 1);
-        self.scans += 1;
-
-        Ok(mode)
-    }
 }
