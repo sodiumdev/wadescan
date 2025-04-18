@@ -42,4 +42,4 @@ interface_name = "eth0"
 # AF_XDP stuff, must be a power of two
 umem_size = 1_048_576
 complete_size = 65_536
-tx_size = 65_536
+tx_size = 2048

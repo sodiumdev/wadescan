@@ -1,7 +1,8 @@
-use std::hint::black_box;
-use criterion::{criterion_group, criterion_main, Criterion};
+#![feature(thread_local)]
 
-use std::net::Ipv4Addr;
+use std::hint::black_box;
+
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
 #[cfg(target_pointer_width = "64")]
 const K: usize = 0xf1357aea2e62a9c5;
@@ -14,6 +15,12 @@ const fn finalize_checksum(sum: u32) -> u16 {
     let sum = sum + (sum >> 16);
 
     !(sum as u16)
+}
+
+#[inline(always)]
+const fn finalize_partial(sum: u32) -> u16 {
+    let sum = (sum >> 16) + (sum & 0xffff);
+    (sum + (sum >> 16)) as u16
 }
 
 #[inline(always)]
@@ -53,106 +60,64 @@ const fn tcp_raw_sum(data: *const u8, len: usize) -> u32 {
 }
 
 #[inline(always)]
-const fn ipv4_word_sum(ip: &Ipv4Addr) -> u32 {
-    let octets = ip.octets();
-    u16::from_be_bytes([octets[0], octets[1]]) as u32
-        + u16::from_be_bytes([octets[2], octets[3]]) as u32
+const fn ipv4_sum(ip: &[u8; 4]) -> u32 {
+    u16::from_be_bytes([ip[0], ip[1]]) as u32 + u16::from_be_bytes([ip[2], ip[3]]) as u32
 }
 
 #[inline(always)]
-pub const fn tcp(
-    data: &[u8],
-    source: &Ipv4Addr,
-    destination: &Ipv4Addr
-) -> u16 {
+pub const fn tcp(data: &[u8], source: &[u8; 4], destination: &[u8; 4]) -> u16 {
     finalize_checksum(
-        ipv4_word_sum(source)
-            + ipv4_word_sum(destination)
-            + 6
-            + data.len() as u32
-            + tcp_sum(data)
+        ipv4_sum(source) + ipv4_sum(destination) + 6 + data.len() as u32 + tcp_sum(data),
     )
 }
 
 #[inline(always)]
-pub const fn tcp_raw(
-    data: *const u8,
-    len: usize,
-    source: &Ipv4Addr,
-    destination: &Ipv4Addr
-) -> u16 {
+pub const fn tcp_raw(data: *const u8, len: usize, source: &[u8; 4], destination: &[u8; 4]) -> u16 {
     finalize_checksum(
-        ipv4_word_sum(source)
-            + ipv4_word_sum(destination)
-            + 6
-            + len as u32
-            + tcp_raw_sum(data, len)
+        ipv4_sum(source) + ipv4_sum(destination) + 6 + len as u32 + tcp_raw_sum(data, len),
     )
 }
 
-fn criterion_benchmark(c: &mut Criterion) {
-    c.bench_function("tcp checksum", |b| {
-        b.iter(|| {
-            let a = black_box([0u8; 84]);
-            let len = black_box(62);
-            let source = black_box(Ipv4Addr::new(0, 1, 2, 3));
-            let dest = black_box(Ipv4Addr::new(0, 5, 6, 7));
-
-            black_box(tcp(
-                &a[..len],
-                &source,
-                &dest
-            ));
-        });
-    });
-
-    c.bench_function("tcp checksum p", |b| {
-        b.iter(|| {
-            let a = black_box([0u8; 84]);
-            let len = black_box(84);
-            let source = black_box(Ipv4Addr::new(0, 1, 2, 3));
-            let dest = black_box(Ipv4Addr::new(0, 5, 6, 7));
-
-            black_box(tcp(
-                &a[..len],
-                &source,
-                &dest
-            ));
-        });
-    });
-    
-    c.bench_function("tcp checksum raw", |b| {
-        b.iter(|| {
-            let a = black_box([0u8; 84]);
-            let len = black_box(62);
-            let source = black_box(Ipv4Addr::new(0, 1, 2, 3));
-            let dest = black_box(Ipv4Addr::new(0, 5, 6, 7));
-
-            black_box(tcp_raw(
-                a.as_ptr(),
-                len,
-                &source,
-                &dest
-            ));
-        });
-    });
-
-    c.bench_function("tcp checksum rawp", |b| {
-        b.iter(|| {
-            let a = black_box([0u8; 84]);
-            let len = black_box(84);
-            let source = black_box(Ipv4Addr::new(0, 1, 2, 3));
-            let dest = black_box(Ipv4Addr::new(0, 5, 6, 7));
-
-            black_box(tcp_raw(
-                a.as_ptr(),
-                len,
-                &source,
-                &dest
-            ));
-        });
-    });
+#[inline(always)]
+pub const fn tcp_raw_partial(len: usize, source: &[u8; 4], destination: &[u8; 4]) -> u16 {
+    finalize_partial(ipv4_sum(source) + ipv4_sum(destination) + 6 + len as u32)
 }
 
-criterion_group!(benches, criterion_benchmark);
+fn bench(c: &mut Criterion) {
+    let mut group = c.benchmark_group("checksum");
+    group.throughput(Throughput::Elements(1));
+
+    group.bench_function("ip checksum", |b| {
+        let source = black_box([0, 1, 2, 3]);
+
+        b.iter(|| {
+            black_box(ipv4_sum(&source));
+        });
+    });
+
+    group.bench_function("tcp checksum", |b| {
+        let a = black_box([12u8; 84]);
+        let len = black_box(84);
+        let source = black_box([0, 1, 2, 3]);
+        let dest = black_box([0, 5, 6, 7]);
+
+        b.iter(|| {
+            black_box(tcp_raw(a.as_ptr(), len, &source, &dest));
+        });
+    });
+
+    group.bench_function("tcp partial checksum", |b| {
+        let len = black_box(84);
+        let source = black_box([0, 1, 2, 3]);
+        let dest = black_box([0, 5, 6, 7]);
+
+        b.iter(|| {
+            black_box(tcp_raw_partial(len, &source, &dest));
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench);
 criterion_main!(benches);

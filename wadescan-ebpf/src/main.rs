@@ -1,15 +1,16 @@
 #![no_std]
 #![no_main]
 
-use core::ptr;
+use core::{mem::offset_of, ptr, ptr::read_volatile};
 
 use aya_ebpf::{
-    bindings::xdp_action::XDP_PASS,
+    bindings::xdp_action::{XDP_DROP, XDP_PASS},
     helpers::bpf_xdp_load_bytes,
     macros::{map, xdp},
-    maps::RingBuf,
+    maps::{RingBuf, XskMap},
     programs::XdpContext,
 };
+use aya_log_ebpf::{error, info};
 use network_types::{
     eth::{EthHdr, EtherType},
     ip::{IpProto, Ipv4Hdr},
@@ -17,25 +18,25 @@ use network_types::{
 };
 use wadescan_common::{PacketHeader, PacketType};
 
-const LEN_SIZE: usize = size_of::<u16>();
-const MSS: usize = 1340;
-
 #[map]
-static RING_BUF: RingBuf =
-    RingBuf::with_byte_size((65536 * (PacketHeader::LEN + LEN_SIZE + MSS + 8)) as u32, 0);
+static SOCKS: XskMap = XskMap::with_max_entries(1, 0);
 
-const PORT: u16 = 43169u16.to_be();
+#[unsafe(no_mangle)]
+static SOURCE_PORT: u16 = 0;
 
 #[xdp]
 pub fn wadescan(ctx: XdpContext) -> u32 {
-    match try_receive(ctx) {
-        Ok(ret) => ret,
-        _ => XDP_PASS,
-    }
+    try_receive(ctx).unwrap_or_else(|ret| ret)
 }
 
 #[inline(always)]
-fn try_receive(ctx: XdpContext) -> Result<u32, ()> {
+fn try_receive(ctx: XdpContext) -> Result<u32, u32> {
+    let source_port = unsafe { read_volatile(&SOURCE_PORT) };
+    if source_port == 0 {
+        error!(&ctx, "Source port not set");
+        return Err(XDP_PASS);
+    }
+
     let eth_hdr = ptr_at::<EthHdr>(&ctx, 0)?;
     if unsafe { (*eth_hdr).ether_type } != EtherType::Ipv4 {
         return Ok(XDP_PASS);
@@ -47,119 +48,33 @@ fn try_receive(ctx: XdpContext) -> Result<u32, ()> {
     }
 
     let tcp_hdr = ptr_at::<TcpHdr>(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
-    if unsafe { (*tcp_hdr).dest } != PORT {
-        return Ok(XDP_PASS);
+    if unsafe { (*tcp_hdr).dest } != source_port {
+        return Err(XDP_PASS);
     }
 
-    let offset = EthHdr::LEN + Ipv4Hdr::LEN + unsafe { (*tcp_hdr).doff() as usize } * 4;
-    let start = ctx.data();
-    let end = ctx.data_end();
+    if unsafe { (*tcp_hdr).rst() } == 0 {
+        return Ok(XDP_DROP);
+    }
 
-    let addr = start + offset;
-    let len = end - addr;
+    /*SOCKS.redirect(
+        0, // unsafe { &*ctx.ctx }.rx_queue_index,
+        XDP_DROP as u64
+    )*/
 
-    let (ip, port) = unsafe {
-        (
-            u32::from_be((&*ip_hdr).src_addr),
-            u16::from_be((&*tcp_hdr).source),
-        )
-    };
-
-    let (seq, ack) = unsafe {
-        (
-            u32::from_be((&*tcp_hdr).seq),
-            u32::from_be((&*tcp_hdr).ack_seq),
-        )
-    };
-
-    output(
-        &ctx,
-        PacketHeader {
-            ty: {
-                if unsafe { (&*tcp_hdr).rst() } != 0 {
-                    return Ok(XDP_PASS);
-                } else if unsafe { (&*tcp_hdr).fin() } != 0 {
-                    PacketType::Fin
-                } else if unsafe { (&*tcp_hdr).ack() } != 0 {
-                    if unsafe { (&*tcp_hdr).syn() } != 0 {
-                        PacketType::SynAck
-                    } else {
-                        PacketType::Ack
-                    }
-                } else {
-                    return Ok(XDP_PASS);
-                }
-            },
-            ip,
-            port,
-            seq,
-            ack,
-        },
-        offset,
-        len,
-    )
+    Ok(XDP_PASS)
 }
 
-#[inline(always)]
-const fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
+#[inline]
+const fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, u32> {
     let start = unsafe { &*ctx.ctx }.data as usize;
     let end = unsafe { &*ctx.ctx }.data_end as usize;
-    let len = size_of::<T>();
 
     let addr = start + offset;
-    if addr + len > end {
-        return Err(());
+    if addr + size_of::<T>() > end {
+        return Err(XDP_PASS);
     }
 
     Ok(addr as *const T)
-}
-
-#[inline(always)]
-fn output(ctx: &XdpContext, packet: PacketHeader, offset: usize, len: usize) -> Result<u32, ()> {
-    match RING_BUF.reserve::<[u8; PacketHeader::LEN + LEN_SIZE + MSS]>(0) {
-        Some(mut event) => {
-            unsafe {
-                ptr::write_unaligned(event.as_mut_ptr() as *mut _, packet);
-                ptr::write_unaligned(
-                    event.as_mut_ptr().byte_add(PacketHeader::LEN) as *mut _,
-                    len as u16,
-                );
-            }
-
-            if len == 0 {
-                event.submit(0);
-
-                return Ok(XDP_PASS);
-            }
-
-            if !aya_ebpf::check_bounds_signed(len as i64, 1, MSS as i64) {
-                event.discard(0);
-
-                return Err(());
-            }
-
-            match unsafe {
-                bpf_xdp_load_bytes(
-                    ctx.ctx,
-                    offset as u32,
-                    event.as_mut_ptr().byte_add(PacketHeader::LEN + LEN_SIZE) as *mut _,
-                    len as u32,
-                )
-            } {
-                0 => {
-                    event.submit(0);
-                    Ok(XDP_PASS)
-                }
-
-                _ => {
-                    event.discard(0);
-                    Err(())
-                }
-            }
-        }
-
-        None => Err(()),
-    }
 }
 
 #[panic_handler]

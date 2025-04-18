@@ -1,53 +1,55 @@
-#![feature(const_vec_string_slice, variant_count)]
-#![feature(generic_arg_infer)]
-#![feature(int_roundings)]
+use std::{io::Error, os::fd::AsRawFd};
 
-pub mod checksum;
-pub mod completer;
-pub mod configfile;
-pub mod excludefile;
-pub mod mode;
-pub mod ping;
-pub mod processor;
-pub mod range;
-pub mod responder;
-pub mod scanner;
-pub mod sender;
-mod shared;
-
-use std::{
-    alloc::{Layout, alloc},
-    env,
-    ffi::CString,
-    ptr::NonNull,
-    sync::Arc,
-};
-
-use anyhow::Context;
 use aya::{
-    maps::RingBuf,
+    Btf, EbpfLoader,
+    maps::XskMap,
     programs::{Xdp, XdpFlags},
 };
-use dashmap::DashMap;
-use default_net::get_interfaces;
-use log::{error, info};
-use mongodb::Client;
-use rustc_hash::FxBuildHasher;
-use xdpilone::{IfInfo, Socket, SocketConfig, Umem, UmemConfig};
-
-use crate::{
-    completer::PacketCompleter,
-    processor::Processor,
-    responder::{Purger, Responder},
-    scanner::Scanner,
-    sender::{ResponseSender, SynSender},
-    shared::FRAME_SIZE,
+use default_net::get_default_interface;
+use libc::{
+    __c_anonymous_xsk_tx_metadata_union, POLLIN, POLLOUT, STDIN_FILENO, XDP_TX_METADATA,
+    XDP_TXMD_FLAGS_CHECKSUM, XDP_TXMD_FLAGS_TIMESTAMP, XDP_USE_NEED_WAKEUP, poll, pollfd,
+    xsk_tx_metadata, xsk_tx_metadata_request,
 };
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() -> anyhow::Result<()> {
-    env_logger::init();
+use crate::{
+    checksum::{finalize_checksum, ipv4_sum, tcp_raw_partial},
+    xdp::socket::{SocketConfig, UmemConfig, XdpSocket},
+};
 
+mod checksum;
+mod xdp;
+
+static SYN_PACKET: [u8; 62] = [
+    // ETHER : [0..14]
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // (dst mac) : [0..6]
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // (src mac) : [6..12]
+    0x08, 0x00, // proto
+    // IP : [14..34]
+    0x45, 0x00, 0x00, 0x30, // version etc
+    0x00, 0x01, 0x00, 0x00, // more irrelevant stuff
+    0x40, 0x06, // ttl, protocol = TCP
+    0x00, 0x00, // [checksum] : [24..26]
+    0, 0, 0, 0, // [src ip] : [26..30]
+    0, 0, 0, 0, // [dst ip] : [30..34]
+    // TCP : [34..62]
+    0xA8, 0xA1, // source port = 43169
+    0x00, 0x00, // [dst port] : [36..38]
+    0x00, 0x00, 0x00, 0x00, // [sequence number] : [38..42]
+    0x00, 0x00, 0x00, 0x00,       // [acknowledgment number] : [42..46]
+    0x70,       // data offset
+    0b00000010, // flags = SYN
+    0x80, 0x00, // window size = 32768
+    0x00, 0x00, // [checksum] : [50..52]
+    0x00, 0x00, // urgent pointer = 0
+    // TCP OPTIONS
+    0x02, 0x04, 0x05, 0x3C, // mss: 1340
+    0x01, 0x01, // nop + nop
+    0x04, 0x02, // sack-perm
+];
+
+#[tokio::main]
+async fn main() {
     unsafe {
         // set resource limit to infinity
         // oom go brr
@@ -57,23 +59,18 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
-        env!("OUT_DIR"),
-        "/wadescan"
-    )))
-    .expect("failed to load ebpf");
-
-    let ring_buf = ebpf
-        .take_map("RING_BUF")
-        .expect("somehow the ring buffer doesnt exist");
-    let ring_buf =
-        RingBuf::try_from(ring_buf).expect("the ring buffer isn't actually a ring buffer");
+    let mut ebpf = EbpfLoader::new()
+        .btf(Btf::from_sys_fs().ok().as_ref())
+        .set_global("SOURCE_PORT", &43169u16, true)
+        .load(aya::include_bytes_aligned!(concat!(
+            env!("OUT_DIR"),
+            "/wadescan"
+        )))
+        .expect("failed to load ebpf");
 
     _ = aya_log::EbpfLogger::init(&mut ebpf);
 
-    let excludefile = excludefile::parse_file("exclude.conf").expect("failed to parse excludefile");
-    let configfile = configfile::parse_file("config.toml").expect("failed to parse configfile");
-
+    let default_interface = get_default_interface().unwrap();
     let program: &mut Xdp = ebpf
         .program_mut("wadescan")
         .expect("failed to find ebpf program")
@@ -84,171 +81,121 @@ async fn main() -> anyhow::Result<()> {
         .load()
         .expect("failed to load ebpf program to the kernel");
     program
-        .attach(&configfile.sender.interface_name, XdpFlags::default())
-        .context("attaching program")
-        .or_else(|_| {
-            program
-                .attach(&configfile.sender.interface_name, XdpFlags::SKB_MODE)
-                .context("attaching program via skb")
-        })?;
-
-    let ping_data: &[u8] = ping::build_latest_request(
-        configfile.ping.protocol_version,
-        &configfile.ping.address,
-        configfile.ping.port,
-    )
-    .leak();
-
-    let seed = rand::random();
-
-    let umem_size = configfile.sender.umem_size;
-    let layout = Layout::from_size_align(umem_size, 16384).context("validating layout")?;
-    let ptr =
-        NonNull::slice_from_raw_parts(unsafe { NonNull::new_unchecked(alloc(layout)) }, umem_size);
-
-    let umem = unsafe {
-        Umem::new(
-            UmemConfig {
-                fill_size: 1, // 0 won't work for some reason
-                complete_size: configfile.sender.complete_size,
-                frame_size: FRAME_SIZE, // anything other than 1 << 12 won't work FOR SOME REASON, that's why it's hardcoded
-                headroom: 0,
-                flags: 0,
-            },
-            ptr,
-        )
-        .expect("failed to create umem")
-    };
-
-    let mut iface = IfInfo::invalid();
-    iface
-        .from_name(
-            &CString::new(&*configfile.sender.interface_name)
-                .expect("error converting interface name to a cstr"),
-        )
-        .expect("failed to find interface");
-
-    let sender_sock =
-        Socket::with_shared(&iface, &umem).expect("failed to create socket for sender");
-    let device = umem
-        .fq_cq(&sender_sock)
-        .expect("failed to create device queue");
-
-    let sender_rxtx = umem
-        .rx_tx(&sender_sock, &SocketConfig {
-            rx_size: None,
-            tx_size: Some(configfile.sender.tx_size),
-            bind_flags: SocketConfig::XDP_BIND_ZEROCOPY | SocketConfig::XDP_BIND_NEED_WAKEUP,
-        })
-        .expect("failed to map rxtx for sender");
-
-    umem.bind(&sender_rxtx)
-        .expect("failed to bind sender rxtx to umem");
-
-    let responder_sock = Socket::new(&iface).expect("failed to create socket for responder");
-    let responder_rxtx = umem
-        .rx_tx(&responder_sock, &SocketConfig {
-            rx_size: None,
-            tx_size: Some(configfile.sender.tx_size),
-            bind_flags: 0,
-        })
-        .expect("failed to map rxtx for responder");
-
-    device
-        .bind(&responder_rxtx)
-        .expect("failed to bind responder to device queue");
-
-    let iface = get_interfaces()
-        .into_iter()
-        .find(|i| i.name == configfile.sender.interface_name)
+        .attach(&default_interface.name, XdpFlags::SKB_MODE)
         .unwrap();
-    let source_ip = iface.ipv4.first().unwrap().addr;
 
-    let gateway_mac = iface.gateway.unwrap().mac_addr.octets();
-    let interface_mac = iface.mac_addr.unwrap().octets();
+    let mut xsk = XskMap::try_from(ebpf.map_mut("SOCKS").unwrap()).unwrap();
 
-    let connections = Arc::new(DashMap::with_hasher(FxBuildHasher));
-    let connections_purger = connections.clone();
+    let mut socket = XdpSocket::new(
+        &SocketConfig {
+            rx_ring_size: 1024,
+            tx_ring_size: 1024,
+            bind_flags: XDP_USE_NEED_WAKEUP,
+            interface_index: default_interface.index,
+            queue_id: 0,
+            busy_poll_budget: None,
+        },
+        &UmemConfig {
+            fill_ring_size: 1024,
+            completion_ring_size: 1024,
+            chunk_count: 1024,
+            chunk_size: 2048,
+            headroom: 0,
+            flags: 0,
+        },
+    )
+    .unwrap();
+    xsk.set(0, &socket, 0).unwrap();
 
-    let client = Client::with_uri_str(configfile.database.url)
-        .await
-        .expect("failed to initiate database connection");
+    let source = default_interface.ipv4.first().unwrap().addr.octets();
 
-    let database = client.database(&configfile.database.name);
-    let servers_collection = database.collection(&configfile.database.servers_collection);
+    let gateway_mac = default_interface.gateway.unwrap().mac_addr.octets();
+    let interface_mac = default_interface.mac_addr.unwrap().octets();
 
-    let tx = responder_rxtx
-        .map_tx()
-        .expect("failed to map tx for responder");
+    for i in 0..1024 {
+        let addr = (i * 2048 + size_of::<xsk_tx_metadata>()) as u64;
+        unsafe {
+            let desc = socket.desc(i);
 
-    let response_sender = ResponseSender::new(
-        tx,
-        &gateway_mac,
-        &interface_mac,
-        source_ip,
-        ping_data,
-        &umem,
-    );
-
-    let (ping_sender, ping_receiver) = flume::unbounded();
-    tokio::spawn(async move {
-        let mut responder = Responder::new(
-            connections,
-            seed,
-            ring_buf,
-            response_sender,
-            ping_sender,
-            ping_data,
-        )
-        .expect("failed to initiate responder");
-
-        loop {
-            if responder.tick().await {
-                break;
-            }
+            desc.addr = addr;
+            desc.len = SYN_PACKET.len() as _;
+            desc.options = XDP_TX_METADATA;
         }
 
-        info!("halting responder...")
-    });
+        let dest = [78, 189, 59, 154];
+        let dest_port = 25565u16;
 
-    tokio::spawn(async move {
-        let purger = Purger::new(
-            connections_purger,
-            configfile.purger.interval,
-            configfile.purger.timeout,
-        );
+        let sum = ipv4_sum(&source) + ipv4_sum(&dest);
 
-        loop {
-            purger.tick().await;
+        let data = socket.get::<u8>(addr as usize).as_ptr();
+        unsafe {
+            data.copy_from_nonoverlapping(SYN_PACKET.as_ptr(), SYN_PACKET.len());
+            data.offset(26).copy_from_nonoverlapping(source.as_ptr(), 4);
+            data.offset(30).copy_from_nonoverlapping(dest.as_ptr(), 4);
+            data.offset(36)
+                .copy_from_nonoverlapping(dest_port.to_be_bytes().as_ptr(), 2);
+            data.copy_from_nonoverlapping(gateway_mac.as_ptr(), 6);
+            data.offset(6)
+                .copy_from_nonoverlapping(interface_mac.as_ptr(), 6);
+            data.offset(24)
+                .copy_from_nonoverlapping(finalize_checksum(34103 + sum).to_be_bytes().as_ptr(), 2);
+            data.offset(50)
+                .copy_from_nonoverlapping(tcp_raw_partial(sum, 28).to_be_bytes().as_ptr(), 2);
+
+            data.cast::<xsk_tx_metadata>()
+                .sub(1)
+                .write_unaligned(xsk_tx_metadata {
+                    flags: (XDP_TXMD_FLAGS_CHECKSUM | XDP_TXMD_FLAGS_TIMESTAMP) as _,
+                    xsk_tx_metadata_union: __c_anonymous_xsk_tx_metadata_union {
+                        request: xsk_tx_metadata_request {
+                            csum_start: 34,
+                            csum_offset: 16,
+                        },
+                    },
+                });
         }
-    });
+    }
 
-    tokio::spawn(async move {
-        let mut completer = PacketCompleter::new(device, configfile.printer.interval);
+    let mut fds: [pollfd; 2] = [
+        pollfd {
+            fd: socket.as_raw_fd(),
+            events: POLLOUT,
+            revents: 0,
+        },
+        pollfd {
+            fd: STDIN_FILENO,
+            events: POLLIN,
+            revents: 0,
+        },
+    ];
 
-        loop {
-            completer.tick();
-        }
-    });
-
-    let ping_receiver_a = ping_receiver.clone();
-    tokio::spawn(async move {
-        let processor = Processor::new(servers_collection, ping_receiver_a);
-
-        loop {
-            if let Err(err) = processor.tick().await {
-                error!("Error at database: {}", err);
-            };
-        }
-    });
-
-    // be ready to melt your fucking network!
-    let tx = sender_rxtx.map_tx().expect("failed to map tx for scanner");
-    let syn_sender = SynSender::new(tx, &gateway_mac, &interface_mac, source_ip, &umem);
-
-    let mut scanner = Scanner::new(seed, excludefile, syn_sender, ping_receiver);
-
+    let batch_size = 256;
+    let mut outstanding = 1024;
     loop {
-        _ = scanner.tick().await;
+        if outstanding > 0 {
+            let sent = socket.submit_tx(batch_size);
+            if sent != 0 && socket.kick_tx() != 0 {
+                panic!("failed to kick tx, error: {:?}", Error::last_os_error());
+            }
+
+            outstanding -= sent;
+        }
+
+        fds[0].revents = 0;
+        if unsafe { poll(fds.as_mut_ptr(), 2, 1000) } < 0 {
+            break;
+        }
+
+        if fds[1].revents != 0 {
+            break;
+        }
+
+        if (fds[0].revents & POLLOUT) == 0 {
+            println!("spin! outstanding: {outstanding}");
+
+            continue;
+        }
+
+        outstanding += socket.complete_tx(batch_size);
     }
 }
