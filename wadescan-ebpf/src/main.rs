@@ -18,9 +18,6 @@ use network_types::{
 };
 use wadescan_common::{PacketHeader, PacketType};
 
-#[map]
-static SOCKS: XskMap = XskMap::with_max_entries(1, 0);
-
 #[unsafe(no_mangle)]
 static SOURCE_PORT: u16 = 0;
 

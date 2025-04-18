@@ -2,7 +2,6 @@ use std::{io::Error, os::fd::AsRawFd};
 
 use aya::{
     Btf, EbpfLoader,
-    maps::XskMap,
     programs::{Xdp, XdpFlags},
 };
 use default_net::get_default_interface;
@@ -84,8 +83,6 @@ async fn main() {
         .attach(&default_interface.name, XdpFlags::SKB_MODE)
         .unwrap();
 
-    let mut xsk = XskMap::try_from(ebpf.map_mut("SOCKS").unwrap()).unwrap();
-
     let mut socket = XdpSocket::new(
         &SocketConfig {
             rx_ring_size: 1024,
@@ -105,7 +102,6 @@ async fn main() {
         },
     )
     .unwrap();
-    xsk.set(0, &socket, 0).unwrap();
 
     let source = default_interface.ipv4.first().unwrap().addr.octets();
 
