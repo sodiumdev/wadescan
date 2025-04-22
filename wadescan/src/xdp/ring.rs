@@ -1,4 +1,5 @@
 use std::{
+    marker::PhantomData,
     ptr::NonNull,
     sync::atomic::{AtomicU32, Ordering},
 };
@@ -6,14 +7,31 @@ use std::{
 use libc::*;
 
 use crate::xdp::{
-    libc::{
-        MapFlags, Mmap, MmapOffsets, Protection, SocketOption,
-        sockopt::{XdpUmemCompletionRing, XdpUmemFillRing, XdpUmemRxRing, XdpUmemTxRing},
-    },
+    libc::{MapFlags, Mmap, MmapOffsets, Protection},
     socket::SocketError,
 };
 
-pub struct Ring<'a> {
+pub enum RingOffset {
+    Fill,
+    Completion,
+    Tx,
+    Rx,
+}
+
+impl RingOffset {
+    #[inline]
+    pub const fn id(&self) -> i64 {
+        match self {
+            RingOffset::Fill => XDP_UMEM_PGOFF_FILL_RING as _,
+            RingOffset::Completion => XDP_UMEM_PGOFF_COMPLETION_RING as _,
+            RingOffset::Tx => XDP_PGOFF_TX_RING,
+            RingOffset::Rx => XDP_PGOFF_RX_RING,
+        }
+    }
+}
+
+pub struct Ring<'a, T> {
+    _phantom: PhantomData<&'a [T]>,
     cached_prod: u32,
     cached_cons: u32,
     mask: usize,
@@ -21,124 +39,61 @@ pub struct Ring<'a> {
 
     producer: &'a AtomicU32,
     consumer: &'a AtomicU32,
-    ring: NonNull<u8>,
+    ring: NonNull<T>,
 }
 
-impl Ring<'_> {
-    #[inline]
-    pub fn fill(fd: i32, size: u32, offsets: &MmapOffsets) -> Result<Self, SocketError> {
-        XdpUmemFillRing::set(fd, &size)?;
+impl<T> Ring<'_, T> {
+    pub fn new(
+        fd: i32,
+        size: u32,
+        offsets: &MmapOffsets,
+        offset: RingOffset,
+    ) -> Result<Self, SocketError> {
+        let ring_offsets = match offset {
+            RingOffset::Fill => &offsets.fill_ring,
+            RingOffset::Completion => &offsets.completion_ring,
+            RingOffset::Tx => &offsets.tx_ring,
+            RingOffset::Rx => &offsets.rx_ring,
+        };
 
-        let area = Mmap::new(
+        let mmap = Mmap::new(
             fd,
-            XDP_UMEM_PGOFF_FILL_RING as _,
-            offsets.fill_ring.desc as usize + size as usize * size_of::<__u64>(),
+            offset.id(),
+            ring_offsets.desc as usize + size as usize * size_of::<T>(),
             Protection::READ | Protection::WRITE,
             MapFlags::SHARED | MapFlags::POPULATE,
         )?;
 
-        let producer =
-            unsafe { AtomicU32::from_ptr(area.offset(offsets.fill_ring.producer).as_ptr()) };
-        let consumer =
-            unsafe { AtomicU32::from_ptr(area.offset(offsets.fill_ring.consumer).as_ptr()) };
+        let producer = unsafe { AtomicU32::from_ptr(mmap.offset(ring_offsets.producer).as_ptr()) };
+        let consumer = unsafe { AtomicU32::from_ptr(mmap.offset(ring_offsets.consumer).as_ptr()) };
+
+        let (cached_prod, cached_cons) = match offset {
+            RingOffset::Fill => (0, size),
+            RingOffset::Completion => (0, 0),
+            RingOffset::Tx => (
+                producer.load(Ordering::Relaxed),
+                consumer.load(Ordering::Relaxed) + size,
+            ),
+            RingOffset::Rx => (
+                producer.load(Ordering::Relaxed),
+                consumer.load(Ordering::Relaxed),
+            ),
+        };
 
         Ok(Self {
-            cached_prod: 0,
-            cached_cons: size,
+            _phantom: PhantomData,
+            cached_prod,
+            cached_cons,
             mask: (size - 1) as usize,
             size,
             producer,
             consumer,
-            ring: area.offset(offsets.fill_ring.desc),
+            ring: mmap.offset(ring_offsets.desc),
         })
     }
 
     #[inline]
-    pub fn completion(fd: i32, size: u32, offsets: &MmapOffsets) -> Result<Self, SocketError> {
-        XdpUmemCompletionRing::set(fd, &size)?;
-
-        let area = Mmap::new(
-            fd,
-            XDP_UMEM_PGOFF_COMPLETION_RING as _,
-            offsets.completion_ring.desc as usize + size as usize * size_of::<__u64>(),
-            Protection::READ | Protection::WRITE,
-            MapFlags::SHARED | MapFlags::POPULATE,
-        )?;
-
-        let producer =
-            unsafe { AtomicU32::from_ptr(area.offset(offsets.completion_ring.producer).as_ptr()) };
-        let consumer =
-            unsafe { AtomicU32::from_ptr(area.offset(offsets.completion_ring.consumer).as_ptr()) };
-
-        Ok(Self {
-            cached_prod: 0,
-            cached_cons: 0,
-            mask: (size - 1) as usize,
-            size,
-            producer,
-            consumer,
-            ring: area.offset(offsets.completion_ring.desc),
-        })
-    }
-
-    #[inline]
-    pub fn rx(fd: i32, size: u32, offsets: &MmapOffsets) -> Result<Self, SocketError> {
-        XdpUmemRxRing::set(fd, &size)?;
-
-        let area = Mmap::new(
-            fd,
-            XDP_PGOFF_RX_RING,
-            offsets.rx_ring.desc as usize + size as usize * size_of::<xdp_desc>(),
-            Protection::READ | Protection::WRITE,
-            MapFlags::SHARED | MapFlags::POPULATE,
-        )?;
-
-        let producer =
-            unsafe { AtomicU32::from_ptr(area.offset(offsets.rx_ring.producer).as_ptr()) };
-        let consumer =
-            unsafe { AtomicU32::from_ptr(area.offset(offsets.rx_ring.consumer).as_ptr()) };
-
-        Ok(Self {
-            cached_prod: producer.load(Ordering::Relaxed),
-            cached_cons: consumer.load(Ordering::Relaxed),
-            mask: (size - 1) as usize,
-            size,
-            producer,
-            consumer,
-            ring: area.offset(offsets.rx_ring.desc),
-        })
-    }
-
-    #[inline]
-    pub fn tx(fd: i32, size: u32, offsets: &MmapOffsets) -> Result<Self, SocketError> {
-        XdpUmemTxRing::set(fd, &size)?;
-
-        let area = Mmap::new(
-            fd,
-            XDP_PGOFF_TX_RING,
-            offsets.tx_ring.desc as usize + size as usize * size_of::<xdp_desc>(),
-            Protection::READ | Protection::WRITE,
-            MapFlags::SHARED | MapFlags::POPULATE,
-        )?;
-
-        let producer =
-            unsafe { AtomicU32::from_ptr(area.offset(offsets.tx_ring.producer).as_ptr()) };
-        let consumer =
-            unsafe { AtomicU32::from_ptr(area.offset(offsets.tx_ring.consumer).as_ptr()) };
-
-        Ok(Self {
-            cached_prod: producer.load(Ordering::Relaxed),
-            cached_cons: consumer.load(Ordering::Relaxed) + size,
-            mask: (size - 1) as usize,
-            size,
-            producer,
-            consumer,
-            ring: area.offset(offsets.tx_ring.desc),
-        })
-    }
-
-    #[inline]
-    pub fn nb_free(&mut self, nb: __u32) -> __u32 {
+    pub fn nb_free(&mut self, nb: u32) -> u32 {
         let free_entries = self.cached_cons - self.cached_prod;
         if free_entries >= nb {
             return free_entries;
@@ -191,7 +146,7 @@ impl Ring<'_> {
     }
 
     #[inline]
-    pub unsafe fn get_unchecked_mut(&mut self, index: usize) -> &mut xdp_desc {
-        unsafe { self.ring.cast().add(index & self.mask).as_mut() }
+    pub unsafe fn get_unchecked_mut(&mut self, index: usize) -> &mut T {
+        unsafe { self.ring.add(index & self.mask).as_mut() }
     }
 }

@@ -95,8 +95,8 @@ async fn main() {
         &UmemConfig {
             fill_ring_size: 1024,
             completion_ring_size: 1024,
-            chunk_count: 1024,
-            chunk_size: 2048,
+            chunk_count: 2048,
+            chunk_size: 4096,
             headroom: 0,
             flags: 0,
         },
@@ -108,13 +108,13 @@ async fn main() {
     let gateway_mac = default_interface.gateway.unwrap().mac_addr.octets();
     let interface_mac = default_interface.mac_addr.unwrap().octets();
 
-    for i in 0..1024 {
-        let addr = (i * 2048 + size_of::<xsk_tx_metadata>()) as u64;
+    for i in 0..4096 {
+        let addr = (i * 4096 + size_of::<xsk_tx_metadata>()) as u64;
         unsafe {
-            let desc = socket.desc(i);
+            let desc = socket.get_unchecked_mut(i);
 
-            desc.addr = addr;
-            desc.len = SYN_PACKET.len() as _;
+            desc.addr = addr; // SIGSEGV: address not mapped to object
+            desc.len = SYN_PACKET.len() as u32;
             desc.options = XDP_TX_METADATA;
         }
 
@@ -123,7 +123,7 @@ async fn main() {
 
         let sum = ipv4_sum(&source) + ipv4_sum(&dest);
 
-        let data = socket.get::<u8>(addr as usize).as_ptr();
+        let data = socket.get(addr as usize).as_ptr();
         unsafe {
             data.copy_from_nonoverlapping(SYN_PACKET.as_ptr(), SYN_PACKET.len());
             data.offset(26).copy_from_nonoverlapping(source.as_ptr(), 4);
@@ -170,7 +170,7 @@ async fn main() {
     loop {
         if outstanding > 0 {
             let sent = socket.submit_tx(batch_size);
-            if sent != 0 && socket.kick_tx() != 0 {
+            if sent != 0 && socket.wake() != 0 {
                 panic!("failed to kick tx, error: {:?}", Error::last_os_error());
             }
 

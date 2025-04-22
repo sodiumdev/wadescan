@@ -9,25 +9,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::xdp::{
     libc::{
-        SocketOption, Umem,
+        Descriptor, SocketOption, Umem,
         sockopt::{
             SocketBusyPoll, SocketBusyPollBudget, SocketOptionKind, SocketPreferBusyPoll,
-            XdpMmapOffsets, XdpUmemReg,
+            XdpMmapOffsets, XdpRxRing, XdpTxRing, XdpUmemCompletionRing, XdpUmemFillRing,
+            XdpUmemReg,
         },
     },
-    ring::Ring,
+    ring::{Ring, RingOffset},
 };
-
-pub struct XdpSocket<'a> {
-    fd: c_int,
-
-    umem: Umem<'a>,
-
-    fill_ring: Ring<'a>,
-    completion_ring: Ring<'a>,
-    rx_ring: Ring<'a>,
-    tx_ring: Ring<'a>,
-}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct UmemConfig {
@@ -58,13 +48,23 @@ pub enum SocketError {
     Bind(Error),
 }
 
+pub struct XdpSocket<'a> {
+    fd: c_int,
+
+    umem: Umem<'a>,
+
+    fill_ring: Ring<'a, u64>,
+    completion_ring: Ring<'a, u64>,
+    rx_ring: Ring<'a, Descriptor>,
+    tx_ring: Ring<'a, Descriptor>,
+}
+
 impl XdpSocket<'_> {
     pub fn new(
         socket_config: &SocketConfig,
         umem_config: &UmemConfig,
     ) -> Result<Self, SocketError> {
         let fd = unsafe { socket(AF_XDP, SOCK_RAW | SOCK_CLOEXEC, 0) };
-
         if fd < 0 {
             return Err(SocketError::Socket(Error::last_os_error()));
         }
@@ -72,12 +72,25 @@ impl XdpSocket<'_> {
         let umem = Umem::new(umem_config)?;
         XdpUmemReg::set(fd, &umem)?;
 
+        XdpUmemFillRing::set(fd, &umem_config.fill_ring_size)?;
+        XdpUmemCompletionRing::set(fd, &umem_config.completion_ring_size)?;
+        XdpRxRing::set(fd, &socket_config.rx_ring_size)?;
+        XdpTxRing::set(fd, &socket_config.tx_ring_size)?;
+
         let offsets = XdpMmapOffsets::get(fd)?;
 
-        let fill_ring = Ring::fill(fd, umem_config.fill_ring_size, &offsets)?;
-        let completion_ring = Ring::completion(fd, umem_config.completion_ring_size, &offsets)?;
-        let rx_ring = Ring::rx(fd, socket_config.rx_ring_size, &offsets)?;
-        let tx_ring = Ring::tx(fd, socket_config.tx_ring_size, &offsets)?;
+        let fill_ring =
+            Ring::<u64>::new(fd, umem_config.fill_ring_size, &offsets, RingOffset::Fill)?;
+        let completion_ring = Ring::<u64>::new(
+            fd,
+            umem_config.completion_ring_size,
+            &offsets,
+            RingOffset::Completion,
+        )?;
+        let rx_ring =
+            Ring::<Descriptor>::new(fd, socket_config.rx_ring_size, &offsets, RingOffset::Rx)?;
+        let tx_ring =
+            Ring::<Descriptor>::new(fd, socket_config.tx_ring_size, &offsets, RingOffset::Tx)?;
 
         if let Some(busy_poll_budget) = &socket_config.busy_poll_budget {
             SocketPreferBusyPoll::set(fd, &1)?;
@@ -86,7 +99,7 @@ impl XdpSocket<'_> {
         }
 
         let sxdp = sockaddr_xdp {
-            sxdp_family: PF_XDP as __u16,
+            sxdp_family: PF_XDP as _,
             sxdp_flags: socket_config.bind_flags,
             sxdp_ifindex: socket_config.interface_index,
             sxdp_queue_id: socket_config.queue_id,
@@ -117,17 +130,17 @@ impl XdpSocket<'_> {
     }
 
     #[inline]
-    pub unsafe fn desc(&mut self, index: usize) -> &mut xdp_desc {
+    pub unsafe fn get_unchecked_mut(&mut self, index: usize) -> &mut Descriptor {
         unsafe { self.tx_ring.get_unchecked_mut(index) }
     }
 
     #[inline]
-    pub fn get<T>(&self, addr: usize) -> NonNull<T> {
-        unsafe { self.umem.area.area.byte_add(addr) }.cast()
+    pub fn get(&self, addr: usize) -> NonNull<u8> {
+        unsafe { self.umem.mmap.area.add(addr) }
     }
 
     #[inline]
-    pub fn kick_tx(&mut self) -> ssize_t {
+    pub fn wake(&mut self) -> ssize_t {
         unsafe { sendto(self.fd, null(), 0, MSG_DONTWAIT, null(), 0) }
     }
 
@@ -158,8 +171,8 @@ impl AsRawFd for XdpSocket<'_> {
     }
 }
 
-impl AsRawFd for &XdpSocket<'_> {
-    fn as_raw_fd(&self) -> RawFd {
-        self.fd
+impl Drop for XdpSocket<'_> {
+    fn drop(&mut self) {
+        unsafe { close(self.fd) };
     }
 }

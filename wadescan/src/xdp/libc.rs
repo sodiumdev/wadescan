@@ -18,30 +18,6 @@ use crate::xdp::{
 pub const SO_PREFER_BUSY_POLL: c_int = 69;
 pub const SO_BUSY_POLL_BUDGET: c_int = 70;
 
-macro_rules! sockopt_err {
-    ($name:ident) => {
-        pub struct $name {
-            inner: Error,
-            opt: SocketOptionKind,
-        }
-
-        impl $name {
-            #[inline]
-            pub fn inner(&self) -> &Error {
-                &self.inner
-            }
-
-            #[inline]
-            pub fn opt(&self) -> SocketOptionKind {
-                self.opt
-            }
-        }
-    };
-}
-
-sockopt_err!(SetSocketOptionError);
-sockopt_err!(GetSocketOptionError);
-
 pub trait SocketOption<T>: Copy + Default {
     const TYPE: SocketOptionKind;
     const LEVEL: c_int;
@@ -95,7 +71,9 @@ pub trait SocketOption<T>: Copy + Default {
 pub mod sockopt {
     use libc::*;
 
-    use crate::xdp::libc::{MmapOffsets, SO_BUSY_POLL_BUDGET, SocketOption, Umem};
+    use crate::xdp::libc::{
+        MmapOffsets, SO_BUSY_POLL_BUDGET, SO_PREFER_BUSY_POLL, SocketOption, Umem,
+    };
 
     macro_rules! option_of {
         ($($stname:ident, $ty:ty, $level:expr, $name:expr)*) => {
@@ -121,11 +99,11 @@ pub mod sockopt {
         XdpUmemReg, Umem<'_>, SOL_XDP, XDP_UMEM_REG
         XdpUmemFillRing, c_uint, SOL_XDP, XDP_UMEM_FILL_RING
         XdpUmemCompletionRing, c_uint, SOL_XDP, XDP_UMEM_COMPLETION_RING
-        XdpUmemRxRing, c_uint, SOL_XDP, XDP_RX_RING
-        XdpUmemTxRing, c_uint, SOL_XDP, XDP_TX_RING
+        XdpRxRing, c_uint, SOL_XDP, XDP_RX_RING
+        XdpTxRing, c_uint, SOL_XDP, XDP_TX_RING
         XdpMmapOffsets, MmapOffsets, SOL_XDP, XDP_MMAP_OFFSETS
         SocketBusyPoll, c_int, SOL_SOCKET, SO_BUSY_POLL
-        SocketPreferBusyPoll, c_int, SOL_SOCKET, SO_BUSY_POLL
+        SocketPreferBusyPoll, c_int, SOL_SOCKET, SO_PREFER_BUSY_POLL
         SocketBusyPollBudget, c_int, SOL_SOCKET, SO_BUSY_POLL_BUDGET
     );
 }
@@ -161,7 +139,14 @@ bitflags! {
 }
 
 #[repr(C)]
-pub struct RingOffset {
+pub struct Descriptor {
+    pub addr: u64,
+    pub len: u32,
+    pub options: u32,
+}
+
+#[repr(C)]
+pub struct RingAddressOffsets {
     pub producer: u64,
     pub consumer: u64,
     pub desc: u64,
@@ -170,15 +155,15 @@ pub struct RingOffset {
 
 #[repr(C)]
 pub struct MmapOffsets {
-    pub rx_ring: RingOffset,
-    pub tx_ring: RingOffset,
-    pub fill_ring: RingOffset,
-    pub completion_ring: RingOffset,
+    pub rx_ring: RingAddressOffsets,
+    pub tx_ring: RingAddressOffsets,
+    pub fill_ring: RingAddressOffsets,
+    pub completion_ring: RingAddressOffsets,
 }
 
 #[repr(C)]
 pub struct Mmap<'a> {
-    _phantom: PhantomData<&'a [u8]>,
+    _phantom: PhantomData<&'a u8>,
     // guaranteed 64-bit for 64-bit systems
     pub(crate) area: NonNull<u8>,
     len: u64,
@@ -194,7 +179,6 @@ impl Mmap<'_> {
         flags: MapFlags,
     ) -> Result<Self, SocketError> {
         let area = unsafe { mmap(null_mut(), len, prot.bits(), flags.bits(), fd, offset) };
-
         if area == MAP_FAILED {
             return Err(SocketError::Mmap(Error::last_os_error()));
         }
@@ -210,7 +194,7 @@ impl Mmap<'_> {
 
     #[inline]
     pub fn offset<T>(&self, offset: u64) -> NonNull<T> {
-        unsafe { self.area.add(offset as usize * size_of::<T>()) }.cast()
+        unsafe { self.area.add(offset as usize) }.cast()
     }
 }
 
@@ -224,7 +208,7 @@ impl Drop for Mmap<'_> {
 
 #[repr(C)]
 pub struct Umem<'a> {
-    pub(crate) area: Mmap<'a>,
+    pub(crate) mmap: Mmap<'a>,
     chunk_size: u32,
     headroom: u32,
     flags: u32,
@@ -234,20 +218,18 @@ pub struct Umem<'a> {
 impl Umem<'_> {
     #[inline]
     pub fn new(umem_config: &UmemConfig) -> Result<Self, SocketError> {
-        let area = Mmap::new(
-            -1,
-            0,
-            umem_config.chunk_count * umem_config.chunk_size as size_t,
-            Protection::READ | Protection::WRITE,
-            MapFlags::PRIVATE | MapFlags::ANONYMOUS | MapFlags::NORESERVE,
-        )?;
-
         Ok(Self {
-            area,
+            mmap: Mmap::new(
+                -1,
+                0,
+                umem_config.chunk_count * umem_config.chunk_size as usize,
+                Protection::READ | Protection::WRITE,
+                MapFlags::PRIVATE | MapFlags::ANONYMOUS | MapFlags::NORESERVE,
+            )?,
             chunk_size: umem_config.chunk_size,
             headroom: umem_config.headroom,
             flags: umem_config.flags,
-            tx_metadata_len: size_of::<xsk_tx_metadata>() as __u32,
+            tx_metadata_len: size_of::<xsk_tx_metadata>() as _,
         })
     }
 }
