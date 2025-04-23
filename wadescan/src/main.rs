@@ -1,4 +1,4 @@
-use std::{io::Error, os::fd::AsRawFd};
+use std::os::fd::AsRawFd;
 
 use aya::{
     Btf, EbpfLoader,
@@ -7,7 +7,7 @@ use aya::{
 use default_net::get_default_interface;
 use libc::{
     __c_anonymous_xsk_tx_metadata_union, POLLIN, POLLOUT, STDIN_FILENO, XDP_TX_METADATA,
-    XDP_TXMD_FLAGS_CHECKSUM, XDP_TXMD_FLAGS_TIMESTAMP, XDP_USE_NEED_WAKEUP, poll, pollfd,
+    XDP_TXMD_FLAGS_CHECKSUM, XDP_UMEM_TX_METADATA_LEN, XDP_USE_NEED_WAKEUP, poll, pollfd,
     xsk_tx_metadata, xsk_tx_metadata_request,
 };
 
@@ -83,22 +83,23 @@ async fn main() {
         .attach(&default_interface.name, XdpFlags::SKB_MODE)
         .unwrap();
 
+    let batch_size = 1024;
     let mut socket = XdpSocket::new(
         &SocketConfig {
-            rx_ring_size: 1024,
-            tx_ring_size: 1024,
+            rx_ring_size: 4096,
+            tx_ring_size: 4096,
             bind_flags: XDP_USE_NEED_WAKEUP,
             interface_index: default_interface.index,
             queue_id: 0,
-            busy_poll_budget: None,
+            busy_poll_budget: Some(batch_size),
         },
         &UmemConfig {
-            fill_ring_size: 1024,
-            completion_ring_size: 1024,
-            chunk_count: 2048,
-            chunk_size: 4096,
+            fill_ring_size: 4096,
+            completion_ring_size: 4096,
+            chunk_count: 4096,
+            chunk_size: 2048,
             headroom: 0,
-            flags: 0,
+            flags: XDP_UMEM_TX_METADATA_LEN,
         },
     )
     .unwrap();
@@ -109,13 +110,13 @@ async fn main() {
     let interface_mac = default_interface.mac_addr.unwrap().octets();
 
     for i in 0..4096 {
-        let addr = (i * 4096 + size_of::<xsk_tx_metadata>()) as u64;
+        let addr = (i * 2048 + size_of::<xsk_tx_metadata>()) as u64;
         unsafe {
-            let desc = socket.get_unchecked_mut(i);
+            let desc = socket.tx_ring.get_unchecked_mut(i);
 
-            desc.addr = addr; // SIGSEGV: address not mapped to object
+            desc.addr = addr;
             desc.len = SYN_PACKET.len() as u32;
-            desc.options = XDP_TX_METADATA;
+            desc.options |= XDP_TX_METADATA;
         }
 
         let dest = [78, 189, 59, 154];
@@ -123,8 +124,9 @@ async fn main() {
 
         let sum = ipv4_sum(&source) + ipv4_sum(&dest);
 
-        let data = socket.get(addr as usize).as_ptr();
         unsafe {
+            let data = socket.get::<u8>(addr as usize).as_ptr();
+
             data.copy_from_nonoverlapping(SYN_PACKET.as_ptr(), SYN_PACKET.len());
             data.offset(26).copy_from_nonoverlapping(source.as_ptr(), 4);
             data.offset(30).copy_from_nonoverlapping(dest.as_ptr(), 4);
@@ -140,8 +142,8 @@ async fn main() {
 
             data.cast::<xsk_tx_metadata>()
                 .sub(1)
-                .write_unaligned(xsk_tx_metadata {
-                    flags: (XDP_TXMD_FLAGS_CHECKSUM | XDP_TXMD_FLAGS_TIMESTAMP) as _,
+                .write(xsk_tx_metadata {
+                    flags: XDP_TXMD_FLAGS_CHECKSUM as _,
                     xsk_tx_metadata_union: __c_anonymous_xsk_tx_metadata_union {
                         request: xsk_tx_metadata_request {
                             csum_start: 34,
@@ -165,16 +167,10 @@ async fn main() {
         },
     ];
 
-    let batch_size = 256;
-    let mut outstanding = 1024;
+    let mut outstanding = 4096;
     loop {
         if outstanding > 0 {
-            let sent = socket.submit_tx(batch_size);
-            if sent != 0 && socket.wake() != 0 {
-                panic!("failed to kick tx, error: {:?}", Error::last_os_error());
-            }
-
-            outstanding -= sent;
+            outstanding -= socket.submit_tx(batch_size as u32);
         }
 
         fds[0].revents = 0;
@@ -192,6 +188,6 @@ async fn main() {
             continue;
         }
 
-        outstanding += socket.complete_tx(batch_size);
+        outstanding += socket.complete_tx(batch_size as u32);
     }
 }

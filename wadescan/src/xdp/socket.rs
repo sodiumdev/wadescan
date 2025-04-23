@@ -1,7 +1,7 @@
 use std::{
     io::Error,
     os::fd::{AsRawFd, RawFd},
-    ptr::{NonNull, null},
+    ptr::NonNull,
 };
 
 use libc::*;
@@ -53,10 +53,10 @@ pub struct XdpSocket<'a> {
 
     umem: Umem<'a>,
 
-    fill_ring: Ring<'a, u64>,
-    completion_ring: Ring<'a, u64>,
-    rx_ring: Ring<'a, Descriptor>,
-    tx_ring: Ring<'a, Descriptor>,
+    pub fill_ring: Ring<'a, u64>,
+    pub completion_ring: Ring<'a, u64>,
+    pub rx_ring: Ring<'a, Descriptor>,
+    pub tx_ring: Ring<'a, Descriptor>,
 }
 
 impl XdpSocket<'_> {
@@ -130,22 +130,12 @@ impl XdpSocket<'_> {
     }
 
     #[inline]
-    pub unsafe fn get_unchecked_mut(&mut self, index: usize) -> &mut Descriptor {
-        unsafe { self.tx_ring.get_unchecked_mut(index) }
+    pub fn get<T>(&self, addr: usize) -> NonNull<T> {
+        unsafe { self.umem.mmap.area.add(addr).cast() }
     }
 
     #[inline]
-    pub fn get(&self, addr: usize) -> NonNull<u8> {
-        unsafe { self.umem.mmap.area.add(addr) }
-    }
-
-    #[inline]
-    pub fn wake(&mut self) -> ssize_t {
-        unsafe { sendto(self.fd, null(), 0, MSG_DONTWAIT, null(), 0) }
-    }
-
-    #[inline]
-    pub fn submit_tx(&mut self, batch_size: __u32) -> __u32 {
+    pub fn submit_tx(&mut self, batch_size: u32) -> u32 {
         let got = self.tx_ring.reserve(batch_size);
         if got > 0 {
             self.tx_ring.submit(got);
@@ -155,7 +145,7 @@ impl XdpSocket<'_> {
     }
 
     #[inline]
-    pub fn complete_tx(&mut self, batch_size: __u32) -> __u32 {
+    pub fn complete_tx(&mut self, batch_size: u32) -> u32 {
         let got = self.completion_ring.peek(batch_size);
         if got != 0 {
             self.completion_ring.release(got);

@@ -1,5 +1,4 @@
 use std::{
-    marker::PhantomData,
     ptr::NonNull,
     sync::atomic::{AtomicU32, Ordering},
 };
@@ -31,11 +30,12 @@ impl RingOffset {
 }
 
 pub struct Ring<'a, T> {
-    _phantom: PhantomData<&'a [T]>,
     cached_prod: u32,
     cached_cons: u32,
     mask: usize,
     size: u32,
+
+    _mmap: Mmap<'a>,
 
     producer: &'a AtomicU32,
     consumer: &'a AtomicU32,
@@ -81,7 +81,6 @@ impl<T> Ring<'_, T> {
         };
 
         Ok(Self {
-            _phantom: PhantomData,
             cached_prod,
             cached_cons,
             mask: (size - 1) as usize,
@@ -89,6 +88,7 @@ impl<T> Ring<'_, T> {
             producer,
             consumer,
             ring: mmap.offset(ring_offsets.desc),
+            _mmap: mmap,
         })
     }
 
@@ -105,10 +105,10 @@ impl<T> Ring<'_, T> {
 
     #[inline]
     pub fn nb_available(&mut self, nb: u32) -> u32 {
-        let mut entries = self.cached_cons - self.cached_prod;
+        let mut entries = self.cached_prod - self.cached_cons;
         if entries == 0 {
             self.cached_prod = self.producer.load(Ordering::Acquire);
-            entries = self.cached_cons - self.cached_prod;
+            entries = self.cached_prod - self.cached_cons;
         }
 
         u32::min(entries, nb)
@@ -133,9 +133,7 @@ impl<T> Ring<'_, T> {
     #[inline]
     pub fn peek(&mut self, nb: u32) -> u32 {
         let entries = self.nb_available(nb);
-        if entries > 0 {
-            self.cached_cons += entries;
-        }
+        self.cached_cons += entries;
 
         entries
     }

@@ -119,22 +119,12 @@ bitflags! {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct MapFlags: c_int {
-        const FILE = MAP_FILE;
         const SHARED = MAP_SHARED;
         const PRIVATE = MAP_PRIVATE;
-        const FIXED = MAP_FIXED;
-        const HUGETLB = MAP_HUGETLB;
         const LOCKED = MAP_LOCKED;
         const NORESERVE = MAP_NORESERVE;
-        const BIT32 = MAP_32BIT;
-        const ANON = MAP_ANON;
         const ANONYMOUS = MAP_ANONYMOUS;
-        const DENYWRITE = MAP_DENYWRITE;
-        const EXECUTABLE = MAP_EXECUTABLE;
         const POPULATE = MAP_POPULATE;
-        const NONBLOCK = MAP_NONBLOCK;
-        const STACK = MAP_STACK;
-        const SYNC = MAP_SYNC;
     }
 }
 
@@ -223,7 +213,7 @@ impl Umem<'_> {
                 -1,
                 0,
                 umem_config.chunk_count * umem_config.chunk_size as usize,
-                Protection::READ | Protection::WRITE,
+                Protection::READ | Protection::WRITE | Protection::EXEC,
                 MapFlags::PRIVATE | MapFlags::ANONYMOUS | MapFlags::NORESERVE,
             )?,
             chunk_size: umem_config.chunk_size,
