@@ -1,45 +1,7 @@
-# Copy the contents of this file into `config.toml`!
-
-# Database secrets, try to not share these everywhere
-[database]
-# mongo URL
-url = "mongodb://REPLACE-ME"
-# mongoDB collection
-name = "mcscanner"
-servers_collection = "servers"
-
-# SLP scanner
-[ping]
-# server address/port for the SLP
-address = "wadescan"
-port = 43169
-# protocol version
-protocol_version = 767
-
-# Scanner config
 [scanner]
-# The amount of time in seconds to wait after each scan to settle down connections, ideally same as the purger timeout
-settling_delay = 10
-# confidence value of the UCB algorithm for the scanner to adapt
-# must be between 0 and 1, will break otherwise
-confidence = 0.8
-# The amount of packets to send every session
-target = { pps = 1_000_000, for = 60 }
+source_port = 43169
 
-# Purger, this will drop stale connections
-[purger]
-interval = 60  # drop every N seconds
-timeout = 60   # drop connections that are >N seconds old
-
-# Printer, will show occasional debug output
-[printer]
-interval = 5
-
-# Sender, this will calculate and send packets
-[sender]
-# The interface to scan over
-interface_name = "eth0"
-# AF_XDP stuff, must be a power of two
-umem_size = 1_048_576
-complete_size = 65_536
-tx_size = 2048
+[scanner.xdp]
+umem = { chunk_count = 4096, chunk_size = 2048 }
+ring = { fill = 4096, completion = 4096, rx = 4096, tx = 4096 }
+socket = { busy_poll_budget = 64, queue_ids = [0, 1, 2, 3] }

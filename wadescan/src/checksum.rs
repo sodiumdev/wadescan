@@ -56,3 +56,8 @@ pub const fn finalize_partial(sum: u32) -> u16 {
     let sum = (sum >> 16) + (sum & 0xffff);
     (sum + (sum >> 16)) as u16
 }
+
+#[inline(always)]
+pub const fn half_fold(sum: u32) -> u32 {
+    (sum >> 16) + (sum & 0xffff)
+}

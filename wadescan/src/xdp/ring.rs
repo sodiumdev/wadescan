@@ -1,13 +1,13 @@
 use std::{
-    ptr::NonNull,
+    slice::from_raw_parts_mut,
     sync::atomic::{AtomicU32, Ordering},
 };
 
 use libc::*;
 
 use crate::xdp::{
-    libc::{MapFlags, Mmap, MmapOffsets, Protection},
-    socket::SocketError,
+    libc::{MapFlags, Mmap, Protection, RingAddressOffsets},
+    socket::XdpError,
 };
 
 pub enum RingOffset {
@@ -35,27 +35,23 @@ pub struct Ring<'a, T> {
     mask: usize,
     size: u32,
 
-    _mmap: Mmap<'a>,
-
     producer: &'a AtomicU32,
     consumer: &'a AtomicU32,
-    ring: NonNull<T>,
+    pub(crate) ring: &'a mut [T],
+
+    _mmap: Mmap<'a>,
 }
+
+unsafe impl<T> Send for Ring<'_, T> {}
+unsafe impl<T> Sync for Ring<'_, T> {}
 
 impl<T> Ring<'_, T> {
     pub fn new(
         fd: i32,
         size: u32,
-        offsets: &MmapOffsets,
+        ring_offsets: &RingAddressOffsets,
         offset: RingOffset,
-    ) -> Result<Self, SocketError> {
-        let ring_offsets = match offset {
-            RingOffset::Fill => &offsets.fill_ring,
-            RingOffset::Completion => &offsets.completion_ring,
-            RingOffset::Tx => &offsets.tx_ring,
-            RingOffset::Rx => &offsets.rx_ring,
-        };
-
+    ) -> Result<Self, XdpError> {
         let mmap = Mmap::new(
             fd,
             offset.id(),
@@ -87,7 +83,9 @@ impl<T> Ring<'_, T> {
             size,
             producer,
             consumer,
-            ring: mmap.offset(ring_offsets.desc),
+            ring: unsafe {
+                from_raw_parts_mut(mmap.offset(ring_offsets.desc).as_ptr(), size as usize)
+            },
             _mmap: mmap,
         })
     }
@@ -141,10 +139,5 @@ impl<T> Ring<'_, T> {
     #[inline]
     pub fn release(&mut self, nb: u32) {
         self.consumer.fetch_add(nb, Ordering::Release);
-    }
-
-    #[inline]
-    pub unsafe fn get_unchecked_mut(&mut self, index: usize) -> &mut T {
-        unsafe { self.ring.add(index & self.mask).as_mut() }
     }
 }

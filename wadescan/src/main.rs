@@ -1,4 +1,10 @@
-use std::os::fd::AsRawFd;
+#![feature(slice_index_methods)]
+
+use std::{
+    hint,
+    os::fd::AsRawFd,
+    time::{Duration, Instant},
+};
 
 use aya::{
     Btf, EbpfLoader,
@@ -7,16 +13,17 @@ use aya::{
 use default_net::get_default_interface;
 use libc::{
     __c_anonymous_xsk_tx_metadata_union, POLLIN, POLLOUT, STDIN_FILENO, XDP_TX_METADATA,
-    XDP_TXMD_FLAGS_CHECKSUM, XDP_UMEM_TX_METADATA_LEN, XDP_USE_NEED_WAKEUP, poll, pollfd,
-    xsk_tx_metadata, xsk_tx_metadata_request,
+    XDP_TXMD_FLAGS_CHECKSUM, XDP_UMEM_TX_METADATA_LEN, XDP_USE_NEED_WAKEUP, XDP_ZEROCOPY, poll,
+    pollfd, xsk_tx_metadata, xsk_tx_metadata_request,
 };
 
-use crate::{
-    checksum::{finalize_checksum, ipv4_sum, tcp_raw_partial},
-    xdp::socket::{SocketConfig, UmemConfig, XdpSocket},
+use crate::xdp::{
+    libc::Umem,
+    socket::{UmemOptions, XdpSocket},
 };
 
 mod checksum;
+mod configfile;
 mod xdp;
 
 static SYN_PACKET: [u8; 62] = [
@@ -52,15 +59,21 @@ async fn main() {
     unsafe {
         // set resource limit to infinity
         // oom go brr
-        libc::setrlimit(libc::RLIMIT_MEMLOCK, &libc::rlimit {
-            rlim_cur: libc::RLIM_INFINITY,
-            rlim_max: libc::RLIM_INFINITY,
-        });
+        libc::setrlimit(
+            libc::RLIMIT_MEMLOCK,
+            &libc::rlimit {
+                rlim_cur: libc::RLIM_INFINITY,
+                rlim_max: libc::RLIM_INFINITY,
+            },
+        );
     }
 
+    let configfile = configfile::parse("config.toml").expect("Error parsing config.toml");
+
+    let source_port = configfile.scanner.source_port;
     let mut ebpf = EbpfLoader::new()
         .btf(Btf::from_sys_fs().ok().as_ref())
-        .set_global("SOURCE_PORT", &43169u16, true)
+        .set_global("SOURCE_PORT", &source_port, true)
         .load(aya::include_bytes_aligned!(concat!(
             env!("OUT_DIR"),
             "/wadescan"
@@ -83,64 +96,88 @@ async fn main() {
         .attach(&default_interface.name, XdpFlags::SKB_MODE)
         .unwrap();
 
-    let batch_size = 1024;
-    let mut socket = XdpSocket::new(
-        &SocketConfig {
-            rx_ring_size: 4096,
-            tx_ring_size: 4096,
-            bind_flags: XDP_USE_NEED_WAKEUP,
-            interface_index: default_interface.index,
-            queue_id: 0,
-            busy_poll_budget: Some(batch_size),
-        },
-        &UmemConfig {
-            fill_ring_size: 4096,
-            completion_ring_size: 4096,
-            chunk_count: 4096,
-            chunk_size: 2048,
-            headroom: 0,
-            flags: XDP_UMEM_TX_METADATA_LEN,
-        },
-    )
-    .unwrap();
+    let mut umem = Umem::new(&UmemOptions {
+        chunk_count: configfile.scanner.xdp.umem.chunk_count,
+        chunk_size: configfile.scanner.xdp.umem.chunk_size as u32,
+        headroom: 0,
+        flags: XDP_UMEM_TX_METADATA_LEN,
+    })
+    .expect("failed to create UMEM");
+
+    let socket = XdpSocket::new().expect("failed to create XDP socket");
+
+    let mut frcr = socket
+        .frcr(
+            &umem,
+            configfile.scanner.xdp.ring.rx,
+            configfile.scanner.xdp.ring.tx,
+        )
+        .unwrap_or_else(|e| {
+            println!("failed to create frcr, trying without XDP_UMEM_TX_METADATA_LEN flag: {e:?}");
+
+            umem.reset_flags();
+            socket
+                .frcr(
+                    &umem,
+                    configfile.scanner.xdp.ring.rx,
+                    configfile.scanner.xdp.ring.tx,
+                )
+                .expect("failed to create frcr, weird")
+        });
+
+    let mut rxtx = socket
+        .rxtx(
+            configfile.scanner.xdp.ring.rx,
+            configfile.scanner.xdp.ring.tx,
+        )
+        .expect("failed to create rxtx, maybe your ring sizes are off?");
+
+    let batch_size = configfile.scanner.xdp.socket.busy_poll_budget;
+    socket
+        .busy_poll(batch_size)
+        .expect("failed to set busy poll budget");
+
+    socket.bind(
+        XDP_USE_NEED_WAKEUP | XDP_ZEROCOPY,
+        default_interface.index,
+        0,
+        0,
+    ).unwrap_or_else(|e| {
+        println!("failed to bind XDP socket, trying without XDP_ZEROCOPY flag (should be a little slower): {e:?}");
+
+        socket.bind(
+            XDP_USE_NEED_WAKEUP,
+            default_interface.index,
+            0,
+            0,
+        ).expect("failed to bind XDP socket")
+    });
 
     let source = default_interface.ipv4.first().unwrap().addr.octets();
 
     let gateway_mac = default_interface.gateway.unwrap().mac_addr.octets();
     let interface_mac = default_interface.mac_addr.unwrap().octets();
 
-    for i in 0..4096 {
-        let addr = (i * 2048 + size_of::<xsk_tx_metadata>()) as u64;
+    for i in 0..configfile.scanner.xdp.umem.chunk_count {
+        let addr = (i * configfile.scanner.xdp.umem.chunk_size as u32 as usize
+            + size_of::<xsk_tx_metadata>()) as u64;
+        let desc = &mut rxtx[i as u64];
+
+        desc.addr = addr;
+        desc.len = SYN_PACKET.len() as u32;
+        desc.options |= XDP_TX_METADATA;
+
+        let data = &mut umem[addr as usize..];
+
+        data.copy_from_slice(&SYN_PACKET);
+        data[26..30].copy_from_slice(&source);
+        data[32..36].copy_from_slice(&source_port.to_be_bytes());
+        data[0..6].copy_from_slice(&gateway_mac);
+        data[6..12].copy_from_slice(&interface_mac);
+
         unsafe {
-            let desc = socket.tx_ring.get_unchecked_mut(i);
-
-            desc.addr = addr;
-            desc.len = SYN_PACKET.len() as u32;
-            desc.options |= XDP_TX_METADATA;
-        }
-
-        let dest = [78, 189, 59, 154];
-        let dest_port = 25565u16;
-
-        let sum = ipv4_sum(&source) + ipv4_sum(&dest);
-
-        unsafe {
-            let data = socket.get::<u8>(addr as usize).as_ptr();
-
-            data.copy_from_nonoverlapping(SYN_PACKET.as_ptr(), SYN_PACKET.len());
-            data.offset(26).copy_from_nonoverlapping(source.as_ptr(), 4);
-            data.offset(30).copy_from_nonoverlapping(dest.as_ptr(), 4);
-            data.offset(36)
-                .copy_from_nonoverlapping(dest_port.to_be_bytes().as_ptr(), 2);
-            data.copy_from_nonoverlapping(gateway_mac.as_ptr(), 6);
-            data.offset(6)
-                .copy_from_nonoverlapping(interface_mac.as_ptr(), 6);
-            data.offset(24)
-                .copy_from_nonoverlapping(finalize_checksum(34103 + sum).to_be_bytes().as_ptr(), 2);
-            data.offset(50)
-                .copy_from_nonoverlapping(tcp_raw_partial(sum, 28).to_be_bytes().as_ptr(), 2);
-
-            data.cast::<xsk_tx_metadata>()
+            data.as_mut_ptr()
+                .cast::<xsk_tx_metadata>()
                 .sub(1)
                 .write(xsk_tx_metadata {
                     flags: XDP_TXMD_FLAGS_CHECKSUM as _,
@@ -167,10 +204,20 @@ async fn main() {
         },
     ];
 
-    let mut outstanding = 4096;
+    let mut last_print = Instant::now();
+    let mut completed = 0;
+
+    /*
+
+            data[24..26].copy_from_slice(&finalize_checksum(34103 + ipv4_sum(&source)).to_be_bytes());
+            data[50..52].copy_from_slice(&tcp_raw_partial(ipv4_sum(&source), 28).to_be_bytes());
+
+    */
+
+    let mut outstanding = configfile.scanner.xdp.umem.chunk_count as isize;
     loop {
         if outstanding > 0 {
-            outstanding -= socket.submit_tx(batch_size as u32);
+            outstanding -= rxtx.submit(batch_size as u32) as isize;
         }
 
         fds[0].revents = 0;
@@ -184,10 +231,21 @@ async fn main() {
 
         if (fds[0].revents & POLLOUT) == 0 {
             println!("spin! outstanding: {outstanding}");
+            hint::spin_loop(); // idk if this is required
 
             continue;
         }
 
-        outstanding += socket.complete_tx(batch_size as u32);
+        let c = frcr.complete(batch_size as u32) as isize;
+        completed += c;
+        outstanding += c;
+
+        let elapsed = last_print.elapsed();
+        if elapsed > Duration::from_secs(5) {
+            println!("pps: {}", completed as f64 / elapsed.as_secs_f64());
+            last_print = Instant::now();
+
+            completed = 0;
+        }
     }
 }

@@ -2,8 +2,10 @@ use std::{
     io::{Error, ErrorKind},
     marker::PhantomData,
     mem::MaybeUninit,
-    ops::Deref,
-    ptr::{NonNull, null_mut},
+    ops::{Deref, Index, IndexMut, RangeFrom},
+    os::fd::{AsRawFd, RawFd},
+    ptr::{NonNull, null_mut, slice_from_raw_parts, slice_from_raw_parts_mut},
+    slice::SliceIndex,
 };
 
 use bitflags::bitflags;
@@ -11,8 +13,11 @@ use futures::TryStreamExt;
 use libc::*;
 
 use crate::xdp::{
-    libc::sockopt::SocketOptionKind,
-    socket::{SocketError, UmemConfig},
+    libc::sockopt::{
+        SocketOptionKind, XdpRxRing, XdpTxRing, XdpUmemCompletionRing, XdpUmemFillRing,
+    },
+    ring::{Ring, RingOffset},
+    socket::{UmemOptions, XdpError},
 };
 
 pub const SO_PREFER_BUSY_POLL: c_int = 69;
@@ -24,7 +29,7 @@ pub trait SocketOption<T>: Copy + Default {
     const NAME: c_int;
 
     #[inline]
-    fn set(fd: i32, value: &T) -> Result<(), SocketError> {
+    fn set(fd: i32, value: &T) -> Result<(), XdpError> {
         if unsafe {
             setsockopt(
                 fd,
@@ -35,7 +40,7 @@ pub trait SocketOption<T>: Copy + Default {
             )
         } != 0
         {
-            return Err(SocketError::SetSocketOption {
+            return Err(XdpError::SetSocketOption {
                 inner: Error::last_os_error(),
                 opt: Self::TYPE,
             });
@@ -45,7 +50,7 @@ pub trait SocketOption<T>: Copy + Default {
     }
 
     #[inline]
-    fn get(fd: i32) -> Result<T, SocketError> {
+    fn get(fd: i32) -> Result<T, XdpError> {
         let mut uninit = MaybeUninit::<T>::uninit();
         let mut size = size_of::<T>() as socklen_t;
         if unsafe {
@@ -58,7 +63,7 @@ pub trait SocketOption<T>: Copy + Default {
             )
         } != 0
         {
-            return Err(SocketError::GetSocketOption {
+            return Err(XdpError::GetSocketOption {
                 inner: Error::last_os_error(),
                 opt: Self::TYPE,
             });
@@ -153,8 +158,9 @@ pub struct MmapOffsets {
 
 #[repr(C)]
 pub struct Mmap<'a> {
-    _phantom: PhantomData<&'a u8>,
+    _phantom: PhantomData<&'a [u8]>,
     // guaranteed 64-bit for 64-bit systems
+    // for any other bit systems, this will break
     pub(crate) area: NonNull<u8>,
     len: u64,
 }
@@ -167,16 +173,16 @@ impl Mmap<'_> {
         len: usize,
         prot: Protection,
         flags: MapFlags,
-    ) -> Result<Self, SocketError> {
+    ) -> Result<Self, XdpError> {
         let area = unsafe { mmap(null_mut(), len, prot.bits(), flags.bits(), fd, offset) };
-        if area == MAP_FAILED {
-            return Err(SocketError::Mmap(Error::last_os_error()));
+        if std::ptr::eq(area, MAP_FAILED) {
+            return Err(XdpError::Mmap(Error::last_os_error()));
         }
 
         Ok(Self {
             _phantom: Default::default(),
             area: NonNull::new(area.cast()).ok_or_else(|| {
-                SocketError::Mmap(Error::new(ErrorKind::InvalidData, "mmap result is null!"))
+                XdpError::Mmap(Error::new(ErrorKind::InvalidData, "mmap result is null!"))
             })?,
             len: len as _,
         })
@@ -196,9 +202,96 @@ impl Drop for Mmap<'_> {
     }
 }
 
+pub struct FrCr<'a> {
+    fill: Ring<'a, u64>,
+    completion: Ring<'a, u64>,
+}
+
+impl<'a> FrCr<'a> {
+    #[inline]
+    pub(crate) fn new(
+        fd: RawFd,
+        offsets: &MmapOffsets,
+        fill_size: u32,
+        completion_size: u32,
+    ) -> Result<Self, XdpError> {
+        XdpUmemFillRing::set(fd, &fill_size)?;
+        XdpUmemCompletionRing::set(fd, &completion_size)?;
+
+        let fill = Ring::<u64>::new(fd, fill_size, &offsets.fill_ring, RingOffset::Fill)?;
+        let completion = Ring::<u64>::new(
+            fd,
+            completion_size,
+            &offsets.completion_ring,
+            RingOffset::Completion,
+        )?;
+
+        Ok(Self { fill, completion })
+    }
+
+    #[inline]
+    pub fn complete(&mut self, batch_size: u32) -> u32 {
+        let got = self.completion.peek(batch_size);
+        if got != 0 {
+            self.completion.release(got);
+        }
+
+        got
+    }
+}
+
+pub struct RxTx<'a> {
+    rx: Ring<'a, Descriptor>,
+    tx: Ring<'a, Descriptor>,
+}
+
+impl RxTx<'_> {
+    #[inline]
+    pub(crate) fn new(
+        fd: RawFd,
+        offsets: &MmapOffsets,
+        rx_ring: u32,
+        tx_ring: u32,
+    ) -> Result<Self, XdpError> {
+        XdpRxRing::set(fd, &rx_ring)?;
+        XdpTxRing::set(fd, &tx_ring)?;
+
+        let rx = Ring::<Descriptor>::new(fd, rx_ring, &offsets.rx_ring, RingOffset::Rx)?;
+        let tx = Ring::<Descriptor>::new(fd, tx_ring, &offsets.tx_ring, RingOffset::Tx)?;
+
+        Ok(Self { rx, tx })
+    }
+
+    #[inline]
+    pub fn submit(&mut self, batch_size: u32) -> u32 {
+        let got = self.tx.reserve(batch_size);
+        if got > 0 {
+            self.tx.submit(got);
+        }
+
+        got
+    }
+}
+
+impl Index<u64> for RxTx<'_> {
+    type Output = Descriptor;
+
+    #[inline]
+    fn index(&self, index: u64) -> &Descriptor {
+        &self.tx.ring[index as usize]
+    }
+}
+
+impl IndexMut<u64> for RxTx<'_> {
+    #[inline]
+    fn index_mut(&mut self, index: u64) -> &mut Descriptor {
+        &mut self.tx.ring[index as usize]
+    }
+}
+
 #[repr(C)]
 pub struct Umem<'a> {
-    pub(crate) mmap: Mmap<'a>,
+    mmap: Mmap<'a>,
     chunk_size: u32,
     headroom: u32,
     flags: u32,
@@ -207,13 +300,13 @@ pub struct Umem<'a> {
 
 impl Umem<'_> {
     #[inline]
-    pub fn new(umem_config: &UmemConfig) -> Result<Self, SocketError> {
+    pub fn new(umem_config: &UmemOptions) -> Result<Self, XdpError> {
         Ok(Self {
             mmap: Mmap::new(
                 -1,
                 0,
                 umem_config.chunk_count * umem_config.chunk_size as usize,
-                Protection::READ | Protection::WRITE | Protection::EXEC,
+                Protection::READ | Protection::WRITE,
                 MapFlags::PRIVATE | MapFlags::ANONYMOUS | MapFlags::NORESERVE,
             )?,
             chunk_size: umem_config.chunk_size,
@@ -221,5 +314,100 @@ impl Umem<'_> {
             flags: umem_config.flags,
             tx_metadata_len: size_of::<xsk_tx_metadata>() as _,
         })
+    }
+
+    #[inline]
+    pub fn reset_flags(&mut self) {
+        self.flags = 0;
+    }
+}
+
+#[inline]
+fn get_noubcheck(index: usize, slice: *const Umem) -> *const [u8] {
+    slice_from_raw_parts(
+        unsafe { (&*slice).mmap.area.add(index).as_ptr() },
+        unsafe { &*slice }.mmap.len as usize - index,
+    )
+}
+
+#[inline]
+fn get_noubcheck_mut(index: usize, slice: *mut Umem) -> *mut [u8] {
+    slice_from_raw_parts_mut(
+        unsafe { (&*slice).mmap.area.add(index).as_ptr() },
+        unsafe { &*slice }.mmap.len as usize - index,
+    )
+}
+
+unsafe impl<'a> SliceIndex<Umem<'a>> for RangeFrom<usize> {
+    type Output = [u8];
+
+    #[inline]
+    fn get(self, slice: &Umem<'a>) -> Option<&'a [u8]> {
+        if self.start > slice.mmap.len as usize {
+            return None;
+        }
+
+        Some(unsafe { &*get_noubcheck(self.start, slice as *const _) })
+    }
+
+    #[inline]
+    fn get_mut(self, slice: &mut Umem<'a>) -> Option<&'a mut [u8]> {
+        if self.start < slice.mmap.len as usize {
+            Some(unsafe { &mut *get_noubcheck_mut(self.start, slice as *mut _) })
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    unsafe fn get_unchecked(self, slice: *const Umem<'a>) -> *const [u8] {
+        unsafe {
+            core::hint::assert_unchecked(self.start < (&*slice).mmap.len as usize);
+        }
+
+        get_noubcheck(self.start, slice)
+    }
+
+    #[inline]
+    unsafe fn get_unchecked_mut(self, slice: *mut Umem<'a>) -> *mut [u8] {
+        unsafe {
+            core::hint::assert_unchecked(self.start < (&*slice).mmap.len as usize);
+        }
+
+        get_noubcheck_mut(self.start, slice)
+    }
+
+    #[inline]
+    fn index(self, slice: &Umem<'a>) -> &'a [u8] {
+        if self.start < slice.mmap.len as usize {
+            unsafe { &*get_noubcheck(self.start, slice as *const _) }
+        } else {
+            panic!("out of bounds")
+        }
+    }
+
+    #[inline]
+    fn index_mut(self, slice: &mut Umem<'a>) -> &'a mut [u8] {
+        if self.start < slice.mmap.len as usize {
+            unsafe { &mut *get_noubcheck_mut(self.start, slice as *mut _) }
+        } else {
+            panic!("out of bounds")
+        }
+    }
+}
+
+impl Index<RangeFrom<usize>> for Umem<'_> {
+    type Output = [u8];
+
+    #[inline]
+    fn index(&self, index: RangeFrom<usize>) -> &[u8] {
+        index.index(self)
+    }
+}
+
+impl IndexMut<RangeFrom<usize>> for Umem<'_> {
+    #[inline]
+    fn index_mut(&mut self, index: RangeFrom<usize>) -> &mut [u8] {
+        index.index_mut(self)
     }
 }
