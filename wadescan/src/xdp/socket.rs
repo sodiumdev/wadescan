@@ -111,10 +111,14 @@ impl XdpSocket {
     }
 
     #[inline]
-    pub fn wake(&self) {
-        unsafe {
-            sendto(self.fd, null(), 0, MSG_DONTWAIT, null(), 0);
+    pub fn wake(&self) -> Result<(), Error> {
+        let ret = unsafe { sendto(self.fd, null(), 0, MSG_DONTWAIT, null(), 0) };
+
+        if ret < 0 {
+            return Err(Error::last_os_error());
         }
+
+        Ok(())
     }
 }
 

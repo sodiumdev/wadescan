@@ -241,8 +241,8 @@ impl<'a> FrCr<'a> {
 }
 
 pub struct RxTx<'a> {
-    rx: Ring<'a, Descriptor>,
-    tx: Ring<'a, Descriptor>,
+    pub rx: Ring<'a, Descriptor>,
+    pub tx: Ring<'a, Descriptor>,
 }
 
 impl RxTx<'_> {
@@ -261,16 +261,6 @@ impl RxTx<'_> {
 
         Ok(Self { rx, tx })
     }
-
-    #[inline]
-    pub fn submit(&mut self, batch_size: u32) -> u32 {
-        let got = self.tx.reserve(batch_size);
-        if got > 0 {
-            self.tx.submit(got);
-        }
-
-        got
-    }
 }
 
 impl Index<u64> for RxTx<'_> {
@@ -278,14 +268,14 @@ impl Index<u64> for RxTx<'_> {
 
     #[inline]
     fn index(&self, index: u64) -> &Descriptor {
-        &self.tx.ring[index as usize]
+        &self.tx.ring[index as usize & self.tx.mask]
     }
 }
 
 impl IndexMut<u64> for RxTx<'_> {
     #[inline]
     fn index_mut(&mut self, index: u64) -> &mut Descriptor {
-        &mut self.tx.ring[index as usize]
+        &mut self.tx.ring[index as usize & self.tx.mask]
     }
 }
 

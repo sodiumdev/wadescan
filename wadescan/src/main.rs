@@ -1,7 +1,6 @@
 #![feature(slice_index_methods)]
 
 use std::{
-    hint,
     os::fd::AsRawFd,
     time::{Duration, Instant},
 };
@@ -12,14 +11,19 @@ use aya::{
 };
 use default_net::get_default_interface;
 use libc::{
-    __c_anonymous_xsk_tx_metadata_union, POLLIN, POLLOUT, STDIN_FILENO, XDP_TX_METADATA,
-    XDP_TXMD_FLAGS_CHECKSUM, XDP_UMEM_TX_METADATA_LEN, XDP_USE_NEED_WAKEUP, XDP_ZEROCOPY, poll,
-    pollfd, xsk_tx_metadata, xsk_tx_metadata_request,
+    __c_anonymous_xsk_tx_metadata_union, F_SETFL, O_NONBLOCK, POLLOUT, XDP_TX_METADATA,
+    XDP_TXMD_FLAGS_CHECKSUM, XDP_UMEM_TX_METADATA_LEN, XDP_USE_NEED_WAKEUP, XDP_ZEROCOPY, fcntl,
+    poll, pollfd, xsk_tx_metadata, xsk_tx_metadata_request,
 };
+use perfect_rand::PerfectRng;
+use rand::random;
 
-use crate::xdp::{
-    libc::Umem,
-    socket::{UmemOptions, XdpSocket},
+use crate::{
+    checksum::{finalize_checksum, ipv4_sum, tcp_raw_partial},
+    xdp::{
+        libc::Umem,
+        socket::{UmemOptions, XdpSocket},
+    },
 };
 
 mod checksum;
@@ -39,7 +43,7 @@ static SYN_PACKET: [u8; 62] = [
     0, 0, 0, 0, // [src ip] : [26..30]
     0, 0, 0, 0, // [dst ip] : [30..34]
     // TCP : [34..62]
-    0xA8, 0xA1, // source port = 43169
+    0x00, 0x00, // [dst port] : [34..36]
     0x00, 0x00, // [dst port] : [36..38]
     0x00, 0x00, 0x00, 0x00, // [sequence number] : [38..42]
     0x00, 0x00, 0x00, 0x00,       // [acknowledgment number] : [42..46]
@@ -109,8 +113,8 @@ async fn main() {
     let mut frcr = socket
         .frcr(
             &umem,
-            configfile.scanner.xdp.ring.rx,
-            configfile.scanner.xdp.ring.tx,
+            configfile.scanner.xdp.ring.fill,
+            configfile.scanner.xdp.ring.completion,
         )
         .unwrap_or_else(|e| {
             println!("failed to create frcr, trying without XDP_UMEM_TX_METADATA_LEN flag: {e:?}");
@@ -119,8 +123,8 @@ async fn main() {
             socket
                 .frcr(
                     &umem,
-                    configfile.scanner.xdp.ring.rx,
-                    configfile.scanner.xdp.ring.tx,
+                    configfile.scanner.xdp.ring.fill,
+                    configfile.scanner.xdp.ring.completion,
                 )
                 .expect("failed to create frcr, weird")
         });
@@ -136,6 +140,10 @@ async fn main() {
     socket
         .busy_poll(batch_size)
         .expect("failed to set busy poll budget");
+
+    unsafe {
+        fcntl(socket.as_raw_fd(), F_SETFL, O_NONBLOCK);
+    }
 
     socket.bind(
         XDP_USE_NEED_WAKEUP | XDP_ZEROCOPY,
@@ -153,7 +161,7 @@ async fn main() {
         ).expect("failed to bind XDP socket")
     });
 
-    let source = default_interface.ipv4.first().unwrap().addr.octets();
+    let source_ip = default_interface.ipv4.first().unwrap().addr.octets();
 
     let gateway_mac = default_interface.gateway.unwrap().mac_addr.octets();
     let interface_mac = default_interface.mac_addr.unwrap().octets();
@@ -167,16 +175,17 @@ async fn main() {
         desc.len = SYN_PACKET.len() as u32;
         desc.options |= XDP_TX_METADATA;
 
-        let data = &mut umem[addr as usize..];
+        let frame = &mut umem[addr as usize..];
 
-        data.copy_from_slice(&SYN_PACKET);
-        data[26..30].copy_from_slice(&source);
-        data[32..36].copy_from_slice(&source_port.to_be_bytes());
-        data[0..6].copy_from_slice(&gateway_mac);
-        data[6..12].copy_from_slice(&interface_mac);
+        frame[..SYN_PACKET.len()].copy_from_slice(&SYN_PACKET);
+        frame[..6].copy_from_slice(&gateway_mac);
+        frame[6..12].copy_from_slice(&interface_mac);
+        frame[26..30].copy_from_slice(&source_ip);
+        frame[34..36].copy_from_slice(&source_port.to_be_bytes());
 
         unsafe {
-            data.as_mut_ptr()
+            frame
+                .as_mut_ptr()
                 .cast::<xsk_tx_metadata>()
                 .sub(1)
                 .write(xsk_tx_metadata {
@@ -191,55 +200,24 @@ async fn main() {
         }
     }
 
-    let mut fds: [pollfd; 2] = [
-        pollfd {
-            fd: socket.as_raw_fd(),
-            events: POLLOUT,
-            revents: 0,
-        },
-        pollfd {
-            fd: STDIN_FILENO,
-            events: POLLIN,
-            revents: 0,
-        },
-    ];
-
     let mut last_print = Instant::now();
     let mut completed = 0;
+    let mut total_sent = 0u64;
 
-    /*
+    let source_sum = ipv4_sum(&source_ip);
+    let checksum_base = 34103 + source_sum;
 
-            data[24..26].copy_from_slice(&finalize_checksum(34103 + ipv4_sum(&source)).to_be_bytes());
-            data[50..52].copy_from_slice(&tcp_raw_partial(ipv4_sum(&source), 28).to_be_bytes());
+    let rng = PerfectRng::new(u32::MAX as u64, random(), 4);
 
-    */
+    let mut fd = pollfd {
+        fd: socket.as_raw_fd(),
+        events: POLLOUT,
+        revents: 0,
+    };
 
+    let batch_size = batch_size as u32;
     let mut outstanding = configfile.scanner.xdp.umem.chunk_count as isize;
     loop {
-        if outstanding > 0 {
-            outstanding -= rxtx.submit(batch_size as u32) as isize;
-        }
-
-        fds[0].revents = 0;
-        if unsafe { poll(fds.as_mut_ptr(), 2, 1000) } < 0 {
-            break;
-        }
-
-        if fds[1].revents != 0 {
-            break;
-        }
-
-        if (fds[0].revents & POLLOUT) == 0 {
-            println!("spin! outstanding: {outstanding}");
-            hint::spin_loop(); // idk if this is required
-
-            continue;
-        }
-
-        let c = frcr.complete(batch_size as u32) as isize;
-        completed += c;
-        outstanding += c;
-
         let elapsed = last_print.elapsed();
         if elapsed > Duration::from_secs(5) {
             println!("pps: {}", completed as f64 / elapsed.as_secs_f64());
@@ -247,5 +225,47 @@ async fn main() {
 
             completed = 0;
         }
+
+        fd.revents = 0;
+        if unsafe { poll(&raw mut fd, 1, 0) } < 0 {
+            break;
+        }
+
+        if (fd.revents & POLLOUT) == 0 {
+            continue;
+        }
+
+        if outstanding > 0 {
+            if let Some(index) = rxtx.tx.reserve(batch_size) {
+                for offset in 0..batch_size {
+                    let index = index + offset;
+
+                    let desc = &rxtx[index as u64];
+                    let frame = &mut umem[desc.addr as usize..];
+
+                    let dest_ip = (rng.shuffle(total_sent + offset as u64) as u32).to_be_bytes();
+                    let dest_port = 25565u16;
+
+                    let dest_sum = ipv4_sum(&dest_ip);
+
+                    frame[30..34].copy_from_slice(&dest_ip);
+                    frame[36..38].copy_from_slice(&dest_port.to_be_bytes());
+                    frame[24..26].copy_from_slice(
+                        &finalize_checksum(checksum_base + dest_sum).to_be_bytes(),
+                    );
+                    frame[50..52]
+                        .copy_from_slice(&tcp_raw_partial(source_sum + dest_sum, 28).to_be_bytes());
+                }
+
+                rxtx.tx.submit(batch_size);
+
+                total_sent = total_sent.wrapping_add(batch_size as u64);
+                outstanding -= batch_size as isize;
+            }
+        }
+
+        let c = frcr.complete(batch_size);
+        completed += c;
+        outstanding += c as isize;
     }
 }

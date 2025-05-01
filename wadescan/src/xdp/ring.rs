@@ -32,12 +32,14 @@ impl RingOffset {
 pub struct Ring<'a, T> {
     cached_prod: u32,
     cached_cons: u32,
-    mask: usize,
+    pub(crate) mask: usize,
     size: u32,
 
     producer: &'a AtomicU32,
     consumer: &'a AtomicU32,
     pub(crate) ring: &'a mut [T],
+
+    flags: &'a AtomicU32,
 
     _mmap: Mmap<'a>,
 }
@@ -86,14 +88,20 @@ impl<T> Ring<'_, T> {
             ring: unsafe {
                 from_raw_parts_mut(mmap.offset(ring_offsets.desc).as_ptr(), size as usize)
             },
+            flags: unsafe { AtomicU32::from_ptr(mmap.offset(ring_offsets.flags).as_ptr()) },
             _mmap: mmap,
         })
     }
 
     #[inline]
-    pub fn nb_free(&mut self, nb: u32) -> u32 {
+    pub fn needs_wakeup(&self) -> bool {
+        (self.flags.load(Ordering::Relaxed) & XDP_RING_NEED_WAKEUP) != 0
+    }
+
+    #[inline]
+    pub fn nb_free(&mut self, batch_size: u32) -> u32 {
         let free_entries = self.cached_cons - self.cached_prod;
-        if free_entries >= nb {
+        if free_entries >= batch_size {
             return free_entries;
         }
 
@@ -102,42 +110,43 @@ impl<T> Ring<'_, T> {
     }
 
     #[inline]
-    pub fn nb_available(&mut self, nb: u32) -> u32 {
+    pub fn nb_available(&mut self, batch_size: u32) -> u32 {
         let mut entries = self.cached_prod - self.cached_cons;
         if entries == 0 {
             self.cached_prod = self.producer.load(Ordering::Acquire);
             entries = self.cached_prod - self.cached_cons;
         }
 
-        u32::min(entries, nb)
+        u32::min(entries, batch_size)
     }
 
     #[inline]
-    pub fn reserve(&mut self, nb: u32) -> u32 {
-        if self.nb_free(nb) < nb {
-            return 0;
+    pub fn reserve(&mut self, batch_size: u32) -> Option<u32> {
+        if self.nb_free(batch_size) < batch_size {
+            return None;
         }
 
-        self.cached_prod += nb;
+        let index = self.cached_prod;
+        self.cached_prod += batch_size;
 
-        nb
+        Some(index)
     }
 
     #[inline]
-    pub fn submit(&mut self, nb: u32) {
-        self.producer.fetch_add(nb, Ordering::Release);
+    pub fn submit(&mut self, batch_size: u32) -> u32 {
+        self.producer.fetch_add(batch_size, Ordering::Release)
     }
 
     #[inline]
-    pub fn peek(&mut self, nb: u32) -> u32 {
-        let entries = self.nb_available(nb);
+    pub fn peek(&mut self, batch_size: u32) -> u32 {
+        let entries = self.nb_available(batch_size);
         self.cached_cons += entries;
 
         entries
     }
 
     #[inline]
-    pub fn release(&mut self, nb: u32) {
-        self.consumer.fetch_add(nb, Ordering::Release);
+    pub fn release(&mut self, nb: u32) -> u32 {
+        self.consumer.fetch_add(nb, Ordering::Release)
     }
 }
