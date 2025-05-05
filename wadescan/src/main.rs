@@ -11,9 +11,9 @@ use aya::{
 };
 use default_net::get_default_interface;
 use libc::{
-    __c_anonymous_xsk_tx_metadata_union, F_SETFL, O_NONBLOCK, POLLOUT, XDP_TX_METADATA,
+    __c_anonymous_xsk_tx_metadata_union, F_SETFL, O_NONBLOCK, XDP_TX_METADATA,
     XDP_TXMD_FLAGS_CHECKSUM, XDP_UMEM_TX_METADATA_LEN, XDP_USE_NEED_WAKEUP, XDP_ZEROCOPY, fcntl,
-    poll, pollfd, xsk_tx_metadata, xsk_tx_metadata_request,
+    xsk_tx_metadata, xsk_tx_metadata_request,
 };
 use perfect_rand::PerfectRng;
 use rand::random;
@@ -158,7 +158,7 @@ async fn main() {
             default_interface.index,
             0,
             0,
-        ).expect("failed to bind XDP socket")
+        ).expect("failed to bind XDP socket, weird")
     });
 
     let source_ip = default_interface.ipv4.first().unwrap().addr.octets();
@@ -209,14 +209,9 @@ async fn main() {
 
     let rng = PerfectRng::new(u32::MAX as u64, random(), 4);
 
-    let mut fd = pollfd {
-        fd: socket.as_raw_fd(),
-        events: POLLOUT,
-        revents: 0,
-    };
-
     let batch_size = batch_size as u32;
-    let mut outstanding = configfile.scanner.xdp.umem.chunk_count as isize;
+    let mut outstanding = configfile.scanner.xdp.ring.tx as isize;
+
     loop {
         let elapsed = last_print.elapsed();
         if elapsed > Duration::from_secs(5) {
@@ -224,15 +219,6 @@ async fn main() {
             last_print = Instant::now();
 
             completed = 0;
-        }
-
-        fd.revents = 0;
-        if unsafe { poll(&raw mut fd, 1, 0) } < 0 {
-            break;
-        }
-
-        if (fd.revents & POLLOUT) == 0 {
-            continue;
         }
 
         if outstanding > 0 {
@@ -262,6 +248,10 @@ async fn main() {
                 total_sent = total_sent.wrapping_add(batch_size as u64);
                 outstanding -= batch_size as isize;
             }
+        }
+
+        if rxtx.tx.needs_wakeup() {
+            socket.wake().unwrap();
         }
 
         let c = frcr.complete(batch_size);

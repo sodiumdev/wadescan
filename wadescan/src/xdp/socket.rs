@@ -115,7 +115,11 @@ impl XdpSocket {
         let ret = unsafe { sendto(self.fd, null(), 0, MSG_DONTWAIT, null(), 0) };
 
         if ret < 0 {
-            return Err(Error::last_os_error());
+            let last = Error::last_os_error();
+            match last.raw_os_error().unwrap() {
+                ENOBUFS | EAGAIN | EBUSY | ENETDOWN => (),
+                _ => return Err(last),
+            }
         }
 
         Ok(())

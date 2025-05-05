@@ -315,7 +315,7 @@ impl Umem<'_> {
 #[inline]
 fn get_noubcheck(index: usize, slice: *const Umem) -> *const [u8] {
     slice_from_raw_parts(
-        unsafe { (&*slice).mmap.area.add(index).as_ptr() },
+        unsafe { (*slice).mmap.area.add(index).as_ptr() },
         unsafe { &*slice }.mmap.len as usize - index,
     )
 }
@@ -323,7 +323,7 @@ fn get_noubcheck(index: usize, slice: *const Umem) -> *const [u8] {
 #[inline]
 fn get_noubcheck_mut(index: usize, slice: *mut Umem) -> *mut [u8] {
     slice_from_raw_parts_mut(
-        unsafe { (&*slice).mmap.area.add(index).as_ptr() },
+        unsafe { (*slice).mmap.area.add(index).as_ptr() },
         unsafe { &*slice }.mmap.len as usize - index,
     )
 }
@@ -352,7 +352,7 @@ unsafe impl<'a> SliceIndex<Umem<'a>> for RangeFrom<usize> {
     #[inline]
     unsafe fn get_unchecked(self, slice: *const Umem<'a>) -> *const [u8] {
         unsafe {
-            core::hint::assert_unchecked(self.start < (&*slice).mmap.len as usize);
+            core::hint::assert_unchecked(self.start < (*slice).mmap.len as usize);
         }
 
         get_noubcheck(self.start, slice)
@@ -361,7 +361,7 @@ unsafe impl<'a> SliceIndex<Umem<'a>> for RangeFrom<usize> {
     #[inline]
     unsafe fn get_unchecked_mut(self, slice: *mut Umem<'a>) -> *mut [u8] {
         unsafe {
-            core::hint::assert_unchecked(self.start < (&*slice).mmap.len as usize);
+            core::hint::assert_unchecked(self.start < (*slice).mmap.len as usize);
         }
 
         get_noubcheck_mut(self.start, slice)
